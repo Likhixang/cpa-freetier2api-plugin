@@ -68,6 +68,55 @@ func IsTransientFailure(err error) bool {
 	return errors.As(err, &failure) && failure.Kind == FailureKindTransient
 }
 
+// TaskRetryAttempts 是任务类上游调用的总尝试次数（含首次）。
+const TaskRetryAttempts = 3
+
+// TaskRetryBaseDelay 是指数退避的基数：0.8s、1.6s。
+const TaskRetryBaseDelay = 800 * time.Millisecond
+
+// IsRetryableFailure 判断任务类调用是否值得重试。
+//
+// 与 IsTransientFailure 的区别在 429：额度查询把 429 当「限流」直接展示给
+// 用户，重试只会把面板拖慢；签到与任务族里 429 是「过几秒就好」的软限流，
+// 一次就判失败会让账号白丢当天的签到。
+func IsRetryableFailure(err error) bool {
+	var failure *Failure
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch failure.Kind {
+	case FailureKindTransient, FailureKindSoftRate, FailureKindRateLimit, FailureKindBusy, FailureKindServer:
+		return true
+	}
+	return false
+}
+
+// WithTaskRetry 在可重试失败上做指数退避，上游给了 Retry-After 就按它等。
+//
+// fn 必须幂等：签到、活跃上报、旅行状态查询在上游都是「做过就返回已完成」，
+// 重放一次不会重复发放。动作类接口（领取、下单）不要套这一层。
+func WithTaskRetry(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < TaskRetryAttempts; attempt++ {
+		if attempt > 0 {
+			delay := TaskRetryBaseDelay << (attempt - 1)
+			if hinted := RetryAfterOf(err); hinted > 0 {
+				delay = hinted
+			}
+			if !SleepContext(ctx, delay) {
+				return ctx.Err()
+			}
+		}
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !IsRetryableFailure(err) {
+			return err
+		}
+	}
+	return err
+}
+
 // IsAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。
 //
 // 只认 401：403/404 往往意味着账号没这个权限或上游改版，刷新不会变好，

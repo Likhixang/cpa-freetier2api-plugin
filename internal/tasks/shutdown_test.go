@@ -2,7 +2,6 @@ package tasks
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -17,7 +16,7 @@ func newLifecycleService() *Service {
 	return &Service{
 		deps:      newFakeDeps(time.Now()),
 		catalog:   NewCatalog(core.NewRegistry()),
-		taskLocks: map[string]*sync.Mutex{},
+		taskLocks: map[string]chan struct{}{},
 		queue:     &queueState{},
 		autoAll:   &autoAllJob{},
 	}

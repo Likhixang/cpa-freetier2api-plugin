@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -676,7 +677,7 @@ func (s *Service) runForAccounts(
 			OK:     false, Message: failure.Message,
 		})
 	}
-	jobResults := auth.RunBatch(loaded, batchConcurrency, func(current auth.Account) accountActionResult {
+	jobResults := runGroupedBatch(ctx, loaded, batchConcurrency, batchAccountGap, func(current auth.Account) accountActionResult {
 		result := accountActionResult{
 			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
 			Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),
@@ -699,6 +700,85 @@ func (s *Service) runForAccounts(
 		return result
 	})
 	return append(results, jobResults...)
+}
+
+// batchAccountGap 是同厂商账号之间的最小间隔。
+//
+// 上游 WAF 看的是同 IP 的突发速率，不是「你有几个账号」：6 路零间隔的批量在
+// 实测里一次点击就把三个厂商同时打进 429（8 个账号挂掉 7 个）。定时路径一直
+// 是串行 + 间隔，从没出过这个问题——两条路径不该有两套节奏。跨厂商仍然并发，
+// 总耗时基本不变，同厂商的峰值降到 1 路。
+const batchAccountGap = 600 * time.Millisecond
+
+// accountVendorIDs 取出每个账号的厂商 ID，供分组用。
+func accountVendorIDs(accounts []auth.Account) []string {
+	ids := make([]string, len(accounts))
+	for index, account := range accounts {
+		ids[index] = account.Vendor.ID()
+	}
+	return ids
+}
+
+// groupIndices 把下标按 key 分组，并保留 key 首次出现的顺序。
+//
+// 分组执行的前提是「同 key 归一组」这件事本身可测：批量动作的节奏问题全在
+// 分组是否正确，真跑上游反而测不出来。
+func groupIndices(keys []string) ([]string, map[string][]int) {
+	order := make([]string, 0, len(keys))
+	buckets := make(map[string][]int, len(keys))
+	for index, key := range keys {
+		if _, seen := buckets[key]; !seen {
+			order = append(order, key)
+		}
+		buckets[key] = append(buckets[key], index)
+	}
+	return order, buckets
+}
+
+// runGroupedBatch 按厂商分组执行批量动作：组内串行并留间隔，组间并发（上限 groups）。
+//
+// 返回结果与 accounts 下标对齐，调用方按原顺序呈现即可。
+func runGroupedBatch(
+	ctx context.Context,
+	accounts []auth.Account,
+	groups int,
+	gap time.Duration,
+	run func(auth.Account) accountActionResult,
+) []accountActionResult {
+	results := make([]accountActionResult, len(accounts))
+	if len(accounts) == 0 {
+		return results
+	}
+	if groups < 1 {
+		groups = 1
+	}
+
+	// 先按厂商归类，保留首次出现的顺序，方便复现与日志对照。
+	order, buckets := groupIndices(accountVendorIDs(accounts))
+
+	semaphore := make(chan struct{}, groups)
+	var waitGroup sync.WaitGroup
+	for _, vendorID := range order {
+		indices := buckets[vendorID]
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			for position, index := range indices {
+				if position > 0 && !core.SleepContext(ctx, gap) {
+					// ctx 已取消：剩下的账号不再打上游，如实标记而不是假装执行过。
+					for _, rest := range indices[position:] {
+						results[rest] = accountActionResult{Message: "已取消"}
+					}
+					return
+				}
+				results[index] = run(accounts[index])
+			}
+		}()
+	}
+	waitGroup.Wait()
+	return results
 }
 
 // runWithAuthRetry 在动作因凭证过期（401）失败时，刷新一次凭证再重试。

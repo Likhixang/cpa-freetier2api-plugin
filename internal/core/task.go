@@ -132,3 +132,66 @@ type ScheduledRunner interface {
 type TaskPreparer interface {
 	PrepareTasks(ctx context.Context, cred *Credential) int
 }
+
+// 一键任务的结果三态。
+//
+// 必须分开：把「无事可做」算成 done 会让用户以为今天领到了东西；把「跳过」
+// 算成 error 又会让正常账号在日志里刷红。
+const (
+	AutoStatusDone    = "done"
+	AutoStatusSkipped = "skipped"
+	AutoStatusError   = "error"
+)
+
+// AutoTaskCodeCheckin 是一键任务里代表「签到」那一行的任务码。
+//
+// 各家的签到本身就是最主要的每日福利（autoclaw 的登录活跃、minimaxcode 的
+// 每日礼包、raccoon 的桌面端登录积分都在这里），所以把它当成一条普通任务
+// 执行，而不是另开一个按钮。
+const AutoTaskCodeCheckin = "(签到)"
+
+// BuildCheckinAutoTask 把供应商的签到折叠成一键任务里的一行。
+//
+// 返回 nil 表示该账号不该出现这一行：供应商没有签到能力，或该账号天生不支持
+// 签到。调用方直接跳过，不要补一条 skipped——那会让用户以为「本该有却失败了」。
+func BuildCheckinAutoTask(ctx context.Context, vendor Vendor, cred *Credential) *AutoTaskResult {
+	provider, okProvider := As[CheckinProvider](vendor)
+	if !okProvider || provider == nil || !provider.SupportsCheckin() {
+		return nil
+	}
+	if capable, okCapable := As[CheckinCapability](vendor); okCapable && !capable.SupportsCheckinFor(cred) {
+		return nil
+	}
+	result, errCheckin := provider.Checkin(ctx, cred)
+	if errCheckin != nil {
+		return &AutoTaskResult{Code: AutoTaskCodeCheckin, Status: AutoStatusError, Message: errCheckin.Error()}
+	}
+	if result == nil {
+		return nil
+	}
+	status := AutoStatusDone
+	message := result.Message
+	switch {
+	case result.NotRecorded:
+		// 「窗口未开启 / 领取被拒 / 上游没发积分」都是本次没真正领到：记成
+		// done 会让用户以为今天领到了东西，必须如实算作跳过。
+		status = AutoStatusSkipped
+		if message == "" {
+			message = "本次未记录（上游窗口未开启或领取被拒）"
+		}
+	case result.Already:
+		status = AutoStatusSkipped
+		if message == "" {
+			message = "今日已签到"
+		}
+	case message == "":
+		message = "签到成功"
+	}
+	return &AutoTaskResult{
+		Code:    AutoTaskCodeCheckin,
+		Status:  status,
+		Message: message,
+		Credit:  result.Credit,
+		Energy:  result.Energy,
+	}
+}

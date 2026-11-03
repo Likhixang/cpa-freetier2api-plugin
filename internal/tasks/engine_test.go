@@ -92,15 +92,17 @@ func TestRunScheduledForAccountSkipsUndeclaredKind(t *testing.T) {
 	service := &Service{}
 	account := &accountContext{vendor: vendor, credential: &core.Credential{FileID: "u1"}}
 
-	if message := service.runScheduledForAccount(context.Background(), account, "dailybonus"); message != "" {
-		t.Fatalf("未声明的任务族应跳过，实际返回 %q", message)
+	message, errRun := service.runScheduledForAccount(context.Background(), account, "dailybonus")
+	if errRun != nil || message != "" {
+		t.Fatalf("未声明的任务族应跳过，实际返回 %q / %v", message, errRun)
 	}
 	if len(vendor.calls) != 0 {
 		t.Fatalf("未声明的任务族不该下发到供应商，实际调用 %v", vendor.calls)
 	}
 
-	if message := service.runScheduledForAccount(context.Background(), account, "travel"); message != "travel done" {
-		t.Fatalf("已声明的任务族应正常执行，返回 %q", message)
+	message, errRun = service.runScheduledForAccount(context.Background(), account, "travel")
+	if errRun != nil || message != "travel done" {
+		t.Fatalf("已声明的任务族应正常执行，返回 %q / %v", message, errRun)
 	}
 	if len(vendor.calls) != 1 || vendor.calls[0] != "travel" {
 		t.Fatalf("调用记录 = %v, want [travel]", vendor.calls)

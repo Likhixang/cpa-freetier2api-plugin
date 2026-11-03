@@ -93,12 +93,23 @@ func (s *Service) Checkin(ctx context.Context, vendor core.Vendor, credential *c
 		}
 	}
 
-	result, errCheckin := provider.Checkin(ctx, credential)
+	// 429 与瞬时故障重试：签到在上游是幂等的（做过就回「已签到」），重放安全。
+	// 一次 429 直接判失败，账号当天就白丢——实测手动批量 8 个账号挂掉 7 个。
+	var result *core.CheckinResult
+	errCheckin := core.WithTaskRetry(ctx, func() error {
+		var errCall error
+		result, errCall = provider.Checkin(ctx, credential)
+		return errCall
+	})
 	if errCheckin != nil && core.IsAuthExpired(errCheckin) {
 		if account := s.findAccount(ctx, "", uid); account != nil {
 			if refreshed, errRefresh := s.RefreshAccount(ctx, "", account); errRefresh == nil && refreshed {
 				credential = account.credential
-				result, errCheckin = provider.Checkin(ctx, credential)
+				errCheckin = core.WithTaskRetry(ctx, func() error {
+					var errCall error
+					result, errCall = provider.Checkin(ctx, credential)
+					return errCall
+				})
 			}
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -28,6 +29,35 @@ type UpstreamError interface {
 	Retryable() bool
 	// UpstreamKind 返回错误分类标识（用于日志与错误码）。
 	UpstreamKind() string
+}
+
+// RetryHinter 由「上游明确告诉你要等多久」的错误实现。
+//
+// 宿主会把等待秒数翻成 Retry-After 响应头交给客户端；没实现或返回 0 时
+// 保持原样（不额外发头）。插件内部的重试也读同一个值，避免两套等待口径。
+type RetryHinter interface {
+	RetryAfter() time.Duration
+}
+
+// RetryAfterOf 取上游明示的等待时长。
+//
+// 先看 RetryHinter 接口，再回落到 *Failure 的 RetryAfter 字段：插件里绝大多数
+// 分类错误都是 *Failure，字段比方法更自然（也不会和既有字段名冲突）。
+func RetryAfterOf(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	var hinter RetryHinter
+	if errors.As(err, &hinter) {
+		if wait := hinter.RetryAfter(); wait > 0 {
+			return wait
+		}
+	}
+	var failure *Failure
+	if errors.As(err, &failure) && failure.RetryAfter > 0 {
+		return failure.RetryAfter
+	}
+	return 0
 }
 
 // UpstreamDetail 由能提供上游原始响应正文的错误实现。
@@ -54,12 +84,137 @@ func ToPluginError(err error) error {
 			status = http.StatusBadGateway
 		}
 		code := upstreamCode(upstreamErr.UpstreamKind())
+		pluginErr := NewPluginError(code, err.Error(), status)
 		if upstreamErr.Retryable() {
-			return RetryablePluginError(code, err.Error(), status)
+			pluginErr.Retryable = true
 		}
-		return NewPluginError(code, err.Error(), status)
+		pluginErr.RetryAfterSeconds = retryAfterSeconds(err)
+		return pluginErr
+	}
+	// 宿主 HTTP 桥在非 2xx 时会把整个响应折叠成一条 RPC 错误文本，插件拿不到
+	// http.Response。这类错误必须按文本还原状态码：否则 429 会被当成普通传输
+	// 故障报 502，宿主不做限流冷却，客户端拿到的是 500。
+	if failure := reconstructBridgeFailure(err); failure != nil {
+		status := failure.HTTPStatus()
+		code := upstreamCode(failure.Kind.String())
+		pluginErr := NewPluginError(code, failure.Msg, status)
+		if failure.Retryable() {
+			pluginErr.Retryable = true
+		}
+		pluginErr.RetryAfterSeconds = retryAfterSeconds(failure)
+		return pluginErr
 	}
 	return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
+}
+
+// bridgeStatusMarkers 是宿主桥错误文本里的状态短语到状态码的映射。
+//
+// 顺序敏感：长短语在前，"Request Entity Too Large" 不能被更短的短语先吃掉。
+var bridgeStatusMarkers = []struct {
+	marker string
+	status int
+}{
+	{"Request Entity Too Large", http.StatusRequestEntityTooLarge},
+	{"Service Unavailable", http.StatusServiceUnavailable},
+	{"Gateway Timeout", http.StatusGatewayTimeout},
+	{"Too Many Requests", http.StatusTooManyRequests},
+	{"Payment Required", http.StatusPaymentRequired},
+	{"Unauthorized", http.StatusUnauthorized},
+	{"Bad Gateway", http.StatusBadGateway},
+	{"Forbidden", http.StatusForbidden},
+	{"Not Found", http.StatusNotFound},
+	{"Bad Request", http.StatusBadRequest},
+}
+
+// reconstructBridgeFailure 把宿主 HTTP 桥的传输层错误还原成分类错误。
+//
+// 只处理带桥标记的错误：普通错误里出现 "not found"（例如本地文件缺失）不该
+// 被误判成上游 404。返回的 Msg 剥掉内部前缀，只留「上游 HTTP 429 Too Many
+// Requests（www.workbuddy.ai）」这种可读形态。
+func reconstructBridgeFailure(err error) *Failure {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	if !strings.Contains(message, "host.http.do") && !strings.Contains(message, "host_call_failed") {
+		return nil
+	}
+	status := 0
+	for _, marker := range bridgeStatusMarkers {
+		if strings.Contains(message, marker.marker) {
+			status = marker.status
+			break
+		}
+	}
+	if status == 0 {
+		return nil
+	}
+	return &Failure{Kind: bridgeFailureKind(status), Status: status, Msg: bridgeFailureMessage(status, message)}
+}
+
+// bridgeFailureKind 把还原出的状态码映射成可处置分类。
+func bridgeFailureKind(status int) FailureKind {
+	switch status {
+	case http.StatusTooManyRequests:
+		return FailureKindSoftRate
+	case http.StatusUnauthorized:
+		return FailureKindCredential
+	case http.StatusPaymentRequired:
+		return FailureKindHardCredit
+	case http.StatusForbidden:
+		return FailureKindWAFBlock
+	case http.StatusNotFound:
+		return FailureKindNotFound
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+		return FailureKindBadParams
+	case http.StatusServiceUnavailable:
+		return FailureKindBusy
+	default:
+		return FailureKindTransient
+	}
+}
+
+// bridgeFailureMessage 生成给下游看的上游错误描述，附上被请求的主机便于定位。
+func bridgeFailureMessage(status int, raw string) string {
+	message := fmt.Sprintf("上游 HTTP %d %s", status, http.StatusText(status))
+	if host := bridgeTargetHost(raw); host != "" {
+		return fmt.Sprintf("%s（%s）", message, host)
+	}
+	return message
+}
+
+// bridgeTargetHost 从 Go http.Client 的错误文本里取出上游主机名。
+//
+// 典型形态：Post "https://www.workbuddy.ai/v2/chat/completions": Too Many Requests
+func bridgeTargetHost(raw string) string {
+	for _, verb := range []string{`Post "`, `Get "`, `Put "`, `Patch "`, `Delete "`} {
+		start := strings.Index(raw, verb)
+		if start < 0 {
+			continue
+		}
+		rest := raw[start+len(verb):]
+		end := strings.IndexByte(rest, '"')
+		if end <= 0 {
+			continue
+		}
+		if parsed, errParse := url.Parse(rest[:end]); errParse == nil && parsed.Host != "" {
+			return parsed.Host
+		}
+	}
+	return ""
+}
+
+// retryAfterSeconds 把上游明示的等待时长取整成秒（0 表示未给出）。
+func retryAfterSeconds(err error) int {
+	wait := RetryAfterOf(err)
+	if wait <= 0 {
+		return 0
+	}
+	seconds := int((wait + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
 }
 
 // upstreamCode 生成错误码：upstream_<kind>。
@@ -84,6 +239,9 @@ type envelopeError struct {
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds 是上游明示的等待秒数。新宿主会把它翻成 Retry-After
+	// 响应头交给客户端；旧宿主忽略该字段，不影响兼容。
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // PluginError 是插件内部的结构化错误：可携带 HTTP 状态码与可重试标记。
@@ -95,6 +253,8 @@ type PluginError struct {
 	Message    string
 	Retryable  bool
 	HTTPStatus int
+	// RetryAfterSeconds 来自上游明示的等待信息（0 表示未给出）。
+	RetryAfterSeconds int
 }
 
 // Error 实现 error 接口。
@@ -140,10 +300,11 @@ func ErrorEnvelopeFromError(err error) []byte {
 	}
 	if pluginErr, ok := err.(*PluginError); ok {
 		raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-			Code:       pluginErr.Code,
-			Message:    pluginErr.Message,
-			Retryable:  pluginErr.Retryable,
-			HTTPStatus: pluginErr.HTTPStatus,
+			Code:              pluginErr.Code,
+			Message:           pluginErr.Message,
+			Retryable:         pluginErr.Retryable,
+			HTTPStatus:        pluginErr.HTTPStatus,
+			RetryAfterSeconds: pluginErr.RetryAfterSeconds,
 		}})
 		return raw
 	}
@@ -228,7 +389,16 @@ func (e *Failure) HTTPStatus() int {
 	if e == nil {
 		return http.StatusBadGateway
 	}
-	if e.Status > 0 {
+	// 账号级故障常被上游包在 400（甚至 200 的 SSE 错误帧）里返回。透传原始
+	// 状态码会让宿主错过 403 软冷却分支，被封的账号于是每轮都被重新选中。
+	// 只对 account_fault 强制 403：session_dead 的原始状态码另有语义
+	// （zcode 的 403 要保留，宿主据此走软冷却而不是刷新凭证）。
+	if e.Kind == FailureKindAccountFault {
+		return http.StatusForbidden
+	}
+	// 只有真正的错误状态才算数：上游把业务错误塞进 200/206 包体时，透传 2xx
+	// 会让宿主把「账号被封」当成成功状态码，冷却分支根本命中不了。
+	if e.Status >= http.StatusBadRequest {
 		return e.Status
 	}
 	switch e.Kind {
@@ -301,10 +471,32 @@ func ClassifyStatus(status int) FailureKind {
 }
 
 // Truncate 截断过长的上游正文，避免错误信息淹没日志。
+//
+// 按字符边界截断而不是按字节：上游正文常是中文，按字节切会把最后一个字符
+// 劈成半个 UTF-8 序列，日志与面板里显示成 U+FFFD。limit 仍按字节口径理解
+// （调用方历来如此），只是切点会回退到字符边界。
 func Truncate(value string, limit int) string {
 	trimmed := strings.TrimSpace(value)
 	if limit <= 0 || len(trimmed) <= limit {
 		return trimmed
 	}
-	return trimmed[:limit] + "..."
+	return TrimToBytes(trimmed, limit) + "..."
+}
+
+// TrimToBytes 把字符串截到不超过 limit 字节，切点落在 UTF-8 字符边界上。
+//
+// 用于「按字节设上限、但不能切坏字符」的场合。limit <= 0 时返回空串。
+func TrimToBytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit
+	// 回退到最近的字符起始字节：UTF-8 续字节形如 10xxxxxx。
+	for cut > 0 && value[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return value[:cut]
 }

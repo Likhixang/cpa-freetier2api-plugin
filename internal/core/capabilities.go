@@ -272,6 +272,21 @@ type ModelCacheLoader interface {
 	LoadModelCache(cached []CachedModel)
 }
 
+// ModelFallbackVeto 由「探测失败必须如实返回空」的供应商实现。
+//
+// 多数供应商的模型清单是账号无关的目录，探测失败（上游抖动、限流、超时）时
+// 回落到上次成功的清单只是恢复可用性；但计费通道的清单本身就是「能推哪些
+// 模型」的判据，回落等于继续推广可能已无权限的模型，必须如实报空。
+type ModelFallbackVeto interface {
+	VetoModelFallback() bool
+}
+
+// VetoesModelFallback 报告该供应商是否拒绝在探测失败时回落缓存。
+func VetoesModelFallback(vendor Vendor) bool {
+	veto, okVeto := As[ModelFallbackVeto](vendor)
+	return okVeto && veto.VetoModelFallback()
+}
+
 // ConsoleModelProvider 由需要向控制台补充展示明细的供应商实现。
 //
 // 未实现时控制台直接用 Catalog 缓存的注册清单（模型 ID、上下文、输出上限、

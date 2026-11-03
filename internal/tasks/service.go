@@ -20,7 +20,7 @@ type Service struct {
 	pokeCh          chan string
 
 	taskLockMu sync.Mutex
-	taskLocks  map[string]*sync.Mutex
+	taskLocks  map[string]chan struct{}
 	queue      *queueState
 	// autoAll 是「一键完成」的后台任务状态（见 autoall.go）。
 	autoAll *autoAllJob
@@ -69,7 +69,7 @@ func New(deps Deps) *Service {
 		deps:      deps,
 		catalog:   NewCatalog(deps.Registry()),
 		pokeCh:    make(chan string, 4),
-		taskLocks: map[string]*sync.Mutex{},
+		taskLocks: map[string]chan struct{}{},
 		queue:     &queueState{},
 		autoAll:   &autoAllJob{},
 	}

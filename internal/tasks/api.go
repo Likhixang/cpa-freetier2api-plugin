@@ -151,8 +151,8 @@ func (s *Service) runAutoAllTargets(ctx context.Context, callbackID string, targ
 			out = append(out, entry)
 			continue
 		}
-		if !s.tryLockAccount(account.uid()) {
-			entry.Skipped = "该账号有其它任务动作在执行"
+		if errLock := s.lockAccount(ctx, account.uid()); errLock != nil {
+			entry.Skipped = "等待该账号的其它任务超时：" + errLock.Error()
 			out = append(out, entry)
 			continue
 		}
