@@ -19,7 +19,7 @@ import (
 const (
 	pluginID          = "freetier2api"
 	pluginDisplayName = "FreeTier 2API"
-	pluginAuthor      = "Likhixang"
+	pluginAuthor      = "jiandanc/Likhixang"
 	pluginRepository  = "https://github.com/Likhixang/cpa-freetier2api-plugin"
 
 	providerKey           = core.ProviderKey
