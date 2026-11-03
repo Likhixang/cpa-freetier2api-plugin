@@ -215,15 +215,6 @@ func startVendorLogin(t *testing.T, vendorID string) pluginapi.AuthLoginStartRes
 	return response
 }
 
-// codeartsPastedCallback 是浏览器授权后停在 127.0.0.1 上的真实回调链接样本。
-//
-// 关键证据：ticket_id / secret 均为**华为云签发**，不是 LoginStart 送进
-// /authorize 的那一对；插件此前拿自造值轮询，控制台因此永远停在「等待授权中…」。
-const codeartsPastedCallback = "http://127.0.0.1/oauth/callback?secret=d55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280" +
-	"&redirect=https%3A%2F%2Fcodearts.huaweicloud.com%2Fportal%2Flogin%3Ftheme%3Dlight%26locale%3Dzh-cn" +
-	"%26ticket_id%3D657abbb247eab363d1a461285fc50145%26authorizationAvailable%3Dfalse" +
-	"%26secret%3Dd55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280"
-
 const codeartsUpstreamSecret = "0628ec6bf686e409a532e813dc1a0140e49d1dcef1f96e2252f5a67e01d715d9"
 
 // TestTraeLoginPollReachesVendorSession 锁定 Trae 的登录轮询能找回自己的会话。

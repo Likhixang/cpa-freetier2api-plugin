@@ -372,12 +372,6 @@ func formatTokens(value float64) string {
 	return strconv.FormatFloat(value, 'f', 0, 64)
 }
 
-// sanitizeMetricKey 把模型名转成稳定的指标键。
-func sanitizeMetricKey(name string) string {
-	replacer := strings.NewReplacer(" ", "_", ".", "_", "/", "_", "-", "_")
-	return strings.ToLower(replacer.Replace(strings.TrimSpace(name)))
-}
-
 // floatField 宽松取浮点字段（JSON 数字一律 float64）。
 func floatField(m map[string]any, key string) float64 {
 	switch v := m[key].(type) {

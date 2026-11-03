@@ -26,8 +26,6 @@ import (
 )
 
 var (
-	// unwrapRe 匹配「再剥一层信封」的写法：.result 后面不接 s（区分合法的 .results）。
-	unwrapRe             = regexp.MustCompile(`\.result\s*[;,)\n]`)
 	pluginIDPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	pluginVersionPattern = regexp.MustCompile(`^[0-9][0-9A-Za-z.+-]*$`)
 	githubRepositoryRe   = regexp.MustCompile(`^https://github\.com/[^/]+/[^/]+$`)

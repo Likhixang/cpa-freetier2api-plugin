@@ -56,11 +56,10 @@ type App struct {
 	backgroundCancel context.CancelFunc
 	backgroundWG     sync.WaitGroup
 
-	streamMu       sync.Mutex
-	streamCancels  map[uint64]context.CancelFunc
-	streamWG       sync.WaitGroup
-	nextStreamKey  uint64
-	pluginStreamID uint64
+	streamMu      sync.Mutex
+	streamCancels map[uint64]context.CancelFunc
+	streamWG      sync.WaitGroup
+	nextStreamKey uint64
 
 	pool  *auth.Pool
 	tasks *tasks.Service

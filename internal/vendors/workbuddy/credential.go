@@ -1,7 +1,6 @@
 package workbuddy
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -555,24 +554,12 @@ const (
 	reportGap = 1050 * time.Millisecond
 	// mpActionGap 是小程序任务写动作之间的间隔。
 	mpActionGap = 2 * time.Second
-	// expertSummonGap 是专家召唤链的间隔（实测 8s 成功率最高，取 6s 折中）。
-	expertSummonGap = 6 * time.Second
 	// nightChatGap 是夜间对话之间的间隔。
 	nightChatGap = 4 * time.Second
-	// acceptBatchGap 是批量接受任务的批间间隔。
-	acceptBatchGap = 1050 * time.Millisecond
-	// acceptBatchSize 是批量接受的每批数量。
-	acceptBatchSize = 20
 )
 
 // 异步计分的轮询参数。
 var (
-	// claimPollAttempts 与 claimPollGap 决定普通任务的等待预算（约 12 秒）。
-	claimPollAttempts = 4
-	claimPollGap      = 3 * time.Second
-	// mpPollAttempts / mpPollGap 是小程序任务的等待预算（约 6 秒）。
-	mpPollAttempts = 2
-	mpPollGap      = 3 * time.Second
 	// schoolPollLoops / schoolPollGap 是开学季的等待预算（约 7.5 秒）。
 	schoolPollLoops = 3
 	schoolPollGap   = 2500 * time.Millisecond
@@ -850,22 +837,6 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) []map[string]an
 
 // SchoolSeasonActivityID 是开学季活动的活动标识（缺它不点亮校园日任务）。
 const SchoolSeasonActivityID = "school_open_day_2026"
-
-// 桌面指纹族请求上下文。
-type desktopContext struct {
-	credential *Credential
-	events     []map[string]any
-}
-
-// run 让事件带上指纹并发出去。
-func (c *desktopContext) run(ctx context.Context, client *Client) error {
-	base := desktopFingerprint(c.credential, client.rt)
-	merged := make([]map[string]any, 0, len(c.events))
-	for _, event := range c.events {
-		merged = append(merged, mergeEvent(base, event))
-	}
-	return client.ReportDesktopEvents(ctx, c.credential, merged)
-}
 
 // ApplyDesktopFingerprint 给事件链注入桌面指纹（导出给 main 包编排使用）。
 func ApplyDesktopFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {

@@ -507,12 +507,3 @@ func containsString(list []string, want string) bool {
 	}
 	return false
 }
-
-// keysOf 返回 map 的键（用于错误信息）。
-func keysOf(source map[string]pluginapi.ModelInfo) []string {
-	out := make([]string, 0, len(source))
-	for key := range source {
-		out = append(out, key)
-	}
-	return out
-}

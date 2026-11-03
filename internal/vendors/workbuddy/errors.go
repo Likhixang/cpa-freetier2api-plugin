@@ -68,8 +68,6 @@ var (
 const (
 	badParamsMarkerMsg  = "unmarshal chat params failed"
 	badParamsMarkerCode = `"code":11101`
-	// modelRateLimitCode 是「模型级」限流：只避让该模型，不惩罚整个账号。
-	modelRateLimitCode = "6004"
 	// modelBlockCode 是「该后端无此模型」。
 	modelBlockCode = "11102"
 	// channelRejectedCode 是渠道校验失败（非官方客户端）。

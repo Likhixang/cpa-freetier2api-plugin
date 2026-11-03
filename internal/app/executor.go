@@ -29,8 +29,6 @@ import (
 const (
 	// executorRPCTimeout 是非流式执行的内部上限（流式另有空闲控制）。
 	executorRPCTimeout = 10 * time.Minute
-	// streamEmitTimeout 是单次流分片投递的上限。
-	streamEmitTimeout = 30 * time.Second
 )
 
 // executorRPCRequest 与宿主的 rpcExecutorRequest 对齐。
