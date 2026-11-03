@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
@@ -1817,12 +1818,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 		"x-model-source": mcSource,
 	}
 
-	preview := prompt
-	if len(preview) > 80 {
-		preview = preview[:80] + "..."
-	}
-	logger.Info("callQoder model=%s prompt=%s", model, preview)
-	logger.Debug("callQoder request body: %s", func() string { d, _ := json.Marshal(body); return string(d) }())
+	logQoderRequest(model, prompt, len(messages), body)
 
 	// ---- SSE 信封重试闸门（第 3 步，参照 hub should_retry_envelope /
 	// aggregate_with_envelope_retry）------------------------------------------
@@ -1913,6 +1909,39 @@ func isRetryableStreamError(err error) bool {
 	return IsTransientTransport(err)
 }
 
+// logQoderRequest 记录一次 Qoder 请求。
+//
+// info 级别只记元数据（模型、消息条数、提示词字符数），不记对话内容：默认
+// 级别就是 info，内容会进日志文件和控制台日志面板。请求体只在 debug 级别
+// 记录，先判断级别再序列化，并在副本上经 redactValue 脱敏（不改动真正发出的 body）。
+func logQoderRequest(model, prompt string, messageCount int, body map[string]interface{}) {
+	logger.Info("callQoder model=%s messages=%d prompt_chars=%d", model, messageCount, utf8.RuneCountInString(prompt))
+	if !logger.DebugEnabled() {
+		return
+	}
+	logger.Debug("callQoder request body: %s", redactedJSON(body))
+}
+
+// redactedJSON 返回 value 脱敏后的 JSON。先经 JSON 往返得到深拷贝，再原地脱敏
+// 拷贝，调用方的数据保持不变。
+func redactedJSON(value interface{}) string {
+	raw, errMarshal := json.Marshal(value)
+	if errMarshal != nil {
+		return fmt.Sprintf("<unserializable: %v>", errMarshal)
+	}
+	var copied interface{}
+	if errUnmarshal := json.Unmarshal(raw, &copied); errUnmarshal != nil {
+		return fmt.Sprintf("<unserializable: %v>", errUnmarshal)
+	}
+	redactValue(copied, "")
+	// 不转义 HTML，日志里直接显示 <redacted len=N>。
+	var out strings.Builder
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(copied)
+	return strings.TrimSuffix(out.String(), "\n")
+}
+
 // sensitiveFieldNames 命中后其字符串子值会被脱敏（递归进数组/对象继续处理）
 var sensitiveFieldNames = map[string]bool{
 	"content":      true,
@@ -1922,14 +1951,21 @@ var sensitiveFieldNames = map[string]bool{
 	"instructions": true,
 	"prompt":       true,
 	"description":  true,
+	"arguments":    true, // 工具调用参数，常含用户数据
+	"image_url":    true, // 其下的 url 多为 base64 图片
 }
 
+// redactValue 原地把敏感字段的字符串值替换成 <redacted len=N>。
+//
+// 字段名本身敏感时，非空字符串一律脱敏（短提示词同样是对话内容）；只是父字段
+// 敏感时（如 content 数组里的 {"type":"text"}），超过 32 字节才脱敏，保留
+// type 这类短标记便于排查。
 func redactValue(v interface{}, parentField string) {
 	switch x := v.(type) {
 	case map[string]interface{}:
 		for k, child := range x {
 			if s, ok := child.(string); ok {
-				if (sensitiveFieldNames[k] || sensitiveFieldNames[parentField]) && len(s) > 32 {
+				if (sensitiveFieldNames[k] && s != "") || (sensitiveFieldNames[parentField] && len(s) > 32) {
 					x[k] = fmt.Sprintf("<redacted len=%d>", len(s))
 				}
 				continue
@@ -1939,7 +1975,8 @@ func redactValue(v interface{}, parentField string) {
 	case []interface{}:
 		for i, item := range x {
 			if s, ok := item.(string); ok {
-				if sensitiveFieldNames[parentField] && len(s) > 32 {
+				// 数组直接挂在敏感字段下（如 "input": ["..."]），元素本身就是内容。
+				if sensitiveFieldNames[parentField] && s != "" {
 					x[i] = fmt.Sprintf("<redacted len=%d>", len(s))
 				}
 				continue

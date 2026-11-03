@@ -181,6 +181,10 @@ func Close() {
 	CloseHostSink()
 }
 
+// DebugEnabled 报告当前是否输出 debug 日志。日志参数构造代价高（如序列化
+// 整个请求体）时先用它判断，避免在不输出的级别下白白做一遍。
+func DebugEnabled() bool { return enabled(LevelDebug) }
+
 // Debug 记录一条 debug 日志。
 func Debug(format string, args ...any) { log(LevelDebug, "DEBUG", format, args...) }
 
