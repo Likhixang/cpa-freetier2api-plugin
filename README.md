@@ -169,7 +169,8 @@ package main / cgo        C ABI 入口（main.go / cgo.go）
        └─ internal/core            供应商无关契约（Vendor、能力接口、注册表、凭证、错误分类）
 ```
 
-- 供应商包只允许依赖 `core`（契约）+ `hostbridge`（宿主通信）+ `logger`（日志），多一个都不行。
+- 供应商包只允许依赖 `core`（契约）+ `hostbridge`（宿主通信）+ `logger`（日志）+ `safe`（协程边界的 panic 恢复），多一个都不行。
+- 插件运行在宿主进程里，任何协程未恢复的 panic 都会让宿主退出：插件自己起的后台协程要在顶层用 `safe.Recover` / `safe.Go` / `safe.Call` 兜住。
 - `internal/core` 只依赖标准库；`internal/app` 是最上层，且只有 `internal/app/vendors.go` 可以 import 具体供应商。
 - 新增内部包必须显式声明分层边界（`layerRules` / `internalPackages`）。
 - 根包（C ABI）的单测与源码同目录（`cgo_test.go`；宿主内存 / 只读页用例在 POSIX 上的 `cgo_hostbuffer_test.go`），不放进 `tests/`。

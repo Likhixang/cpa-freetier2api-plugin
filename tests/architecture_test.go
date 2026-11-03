@@ -189,23 +189,25 @@ type layerRule struct {
 // core（契约）+ hostbridge（宿主通信）+ logger（日志）三者，多一个都不行——
 // 这条规则挡住了 vendor 反向依赖 auth / state / tasks / admin 的所有可能。
 var layerRules = []layerRule{
-	{pkg: "core", forbidden: []string{"admin", "app", "auth", "hostbridge", "logger", "state", "tasks", "vendors"}},
+	{pkg: "core", forbidden: []string{"admin", "app", "auth", "hostbridge", "logger", "safe", "state", "tasks", "vendors"}},
 	{pkg: "logger"},
+	// safe 只做 panic 恢复与记日志，供各层（含供应商）在协程边界使用。
+	{pkg: "safe", allowlist: []string{"logger"}},
 	{pkg: "state", forbidden: []string{"admin", "app", "auth", "hostbridge", "tasks", "vendors"}},
 	{pkg: "hostbridge", forbidden: []string{"admin", "app", "auth", "state", "tasks", "vendors"}},
 	{pkg: "auth", forbidden: []string{"admin", "app", "tasks", "vendors"}},
 	{pkg: "tasks", forbidden: []string{"admin", "app", "vendors"}},
 	{pkg: "admin", forbidden: []string{"app"}},
-	{pkg: "vendors/autoclaw", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/cline", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/codearts", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/minimaxcode", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/opencodezen", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/qoder", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/raccoon", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/trae", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/workbuddy", allowlist: []string{"core", "hostbridge", "logger"}},
-	{pkg: "vendors/zcode", allowlist: []string{"core", "hostbridge", "logger"}},
+	{pkg: "vendors/autoclaw", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/cline", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/codearts", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/minimaxcode", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/opencodezen", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/qoder", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/raccoon", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/trae", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/workbuddy", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
+	{pkg: "vendors/zcode", allowlist: []string{"core", "hostbridge", "logger", "safe"}},
 }
 
 // internalPackages 是 internal/ 下一级允许存在的目录名白名单。
@@ -214,7 +216,7 @@ var layerRules = []layerRule{
 // 白名单会先把它拦下来，提示补规则，而不是让它静默进入依赖图。
 var internalPackages = map[string]bool{
 	"admin": true, "app": true, "auth": true, "core": true,
-	"hostbridge": true, "logger": true, "state": true, "tasks": true, "vendors": true,
+	"hostbridge": true, "logger": true, "safe": true, "state": true, "tasks": true, "vendors": true,
 }
 
 func TestInternalPackageAllowlist(t *testing.T) {
@@ -493,7 +495,7 @@ func TestEveryVendorHasLayerRule(t *testing.T) {
 		}
 		rules[name] = rule
 	}
-	want := []string{"core", "hostbridge", "logger"}
+	want := []string{"core", "hostbridge", "logger", "safe"}
 	for _, dir := range dirs {
 		rule, ok := rules[dir]
 		if !ok {

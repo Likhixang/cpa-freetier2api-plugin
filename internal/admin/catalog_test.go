@@ -3,9 +3,11 @@ package admin
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
 )
@@ -514,5 +516,58 @@ func TestLegacyVendorIDExpandsExtraModels(t *testing.T) {
 	extra := manager.ExtraModels()
 	if len(extra) != 1 || extra[0].OwnedBy != "zcodeglobal" || extra[0].ID != "GLM-5.3" {
 		t.Fatalf("extra models = %#v", extra)
+	}
+}
+
+// panicModelsVendor 拉清单时 panic。
+type panicModelsVendor struct{ fakeVendor }
+
+func (v *panicModelsVendor) StaticModels(context.Context) ([]pluginapi.ModelInfo, error) {
+	panic("models exploded")
+}
+
+// TestProbeVendorPanicReleasesWaiters：探测 panic 按失败处理——等待方被唤醒、
+// 进行中标记被清掉并记下失败冷却，而不是让宿主进程退出。
+func TestProbeVendorPanicReleasesWaiters(t *testing.T) {
+	manager := newTestCatalog(t)
+	vendor := &panicModelsVendor{fakeVendor{Meta: core.Meta{VendorID: "codearts", VendorName: "CodeArts", VendorRegion: "cn"}}}
+	done := make(chan struct{})
+	manager.probeMu.Lock()
+	manager.probing["codearts"] = done
+	manager.probeMu.Unlock()
+
+	manager.probeVendor(vendor, done)
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("done must be closed after a panicking probe")
+	}
+	if running := manager.ProbesRunning(); running != 0 {
+		t.Fatalf("probing must be cleared, %d still running", running)
+	}
+	manager.probeMu.Lock()
+	_, cooled := manager.probeAt["codearts"]
+	manager.probeMu.Unlock()
+	if !cooled {
+		t.Fatal("a panicking probe counts as a failure and must start the cooldown")
+	}
+}
+
+// TestRunAccountActionSafeConvertsPanic：批量动作里单个账号 panic 只让这一个账号失败。
+func TestRunAccountActionSafeConvertsPanic(t *testing.T) {
+	account := auth.Account{Entry: core.HostAuth{ID: "zcode-1", Label: "alice"}}
+	result := runAccountActionSafe(func(auth.Account) accountActionResult {
+		panic("action exploded")
+	}, account)
+	if result.OK || result.AuthID != "zcode-1" || result.Label != "alice" ||
+		!strings.Contains(result.Message, "action exploded") {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	ok := runAccountActionSafe(func(current auth.Account) accountActionResult {
+		return accountActionResult{AuthID: current.Entry.ID, OK: true}
+	}, account)
+	if !ok.OK || ok.AuthID != "zcode-1" {
+		t.Fatalf("normal result must pass through: %+v", ok)
 	}
 }

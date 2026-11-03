@@ -16,6 +16,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
@@ -735,6 +736,20 @@ func groupIndices(keys []string) ([]string, map[string][]int) {
 	return order, buckets
 }
 
+// runAccountActionSafe 执行单个账号的批量动作，把 panic 转成该账号的失败结果。
+func runAccountActionSafe(run func(auth.Account) accountActionResult, account auth.Account) (result accountActionResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = accountActionResult{
+				AuthID:  core.FirstNonEmpty(account.Entry.ID, account.Entry.Name),
+				Label:   core.FirstNonEmpty(account.Entry.Label, account.Entry.Name, account.Entry.ID),
+				Message: safe.NewPanicError("account action "+account.Entry.ID, r).Error(),
+			}
+		}
+	}()
+	return run(account)
+}
+
 // runGroupedBatch 按厂商分组执行批量动作：组内串行并留间隔，组间并发（上限 groups）。
 //
 // 返回结果与 accounts 下标对齐，调用方按原顺序呈现即可。
@@ -773,7 +788,7 @@ func runGroupedBatch(
 					}
 					return
 				}
-				results[index] = run(accounts[index])
+				results[index] = runAccountActionSafe(run, accounts[index])
 			}
 		}()
 	}

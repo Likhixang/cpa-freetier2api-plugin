@@ -29,6 +29,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"errors"
+	"freetier2api-plugin/internal/safe"
 	"regexp"
 	"sort"
 )
@@ -944,6 +945,13 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
+			// 读流协程里的 panic 转成本次请求的错误（errCh 有 1 格缓冲，且此前
+			// 不会有其它发送），而不是让宿主进程退出。
+			defer func() {
+				if r := recover(); r != nil {
+					errCh <- safe.NewPanicError("qoder stream reader", r)
+				}
+			}()
 			scanner := bufio.NewScanner(resp.Body)
 			scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 			for scanner.Scan() {

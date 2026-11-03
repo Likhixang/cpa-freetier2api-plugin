@@ -17,6 +17,7 @@ import (
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 )
 
 // KeepaliveResult 是一个账号的续期结果（管理端点 JSON 契约的一部分）。
@@ -131,7 +132,13 @@ func (s *Service) Keepalive(ctx context.Context, callbackID string, targets []st
 	for _, item := range loaded {
 		jobs = append(jobs, newAccountContext(item))
 	}
-	return auth.RunBatch(jobs, concurrency, func(job *accountContext) KeepaliveResult {
+	return auth.RunBatch(jobs, concurrency, func(job *accountContext) (result KeepaliveResult) {
+		defer func() {
+			if r := recover(); r != nil {
+				result = KeepaliveResult{AuthID: core.FirstNonEmpty(job.entry.ID, job.entry.Name), Label: job.label(),
+					Message: safe.NewPanicError("keepalive "+job.label(), r).Error()}
+			}
+		}()
 		return s.keepaliveOne(ctx, callbackID, job)
 	})
 }

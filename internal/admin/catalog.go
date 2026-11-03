@@ -16,6 +16,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -523,7 +524,14 @@ func (c *Catalog) ProbesRunning() int {
 func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
 	vendorID := vendor.ID()
 	ctx, cancel := context.WithTimeout(context.Background(), modelProbeTimeout)
-	models, errModels := vendor.StaticModels(ctx)
+	// panic 按探测失败处理：下面照常清理 probing 并 close(done)，
+	// 否则 WaitProbes 会白等到超时，这家供应商也再不会被补探测。
+	var models []pluginapi.ModelInfo
+	errModels := safe.Call("model probe "+vendorID, func() error {
+		var errStatic error
+		models, errStatic = vendor.StaticModels(ctx)
+		return errStatic
+	})
 	cancel()
 
 	wrote := false

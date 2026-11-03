@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/safe"
 )
 
 // 本文件实现模型目录：从上游探测模型清单、缓存，并提供窗口与档位的查找链。
@@ -453,31 +454,31 @@ func (c *Client) fetchModelsFromUpstream(region Region) ([]ModelInfo, error) {
 		mu.Unlock()
 	}
 
-	// /v3/config（IDE UA）：两域共用，字段最全。
-	waitGroup.Add(1)
-	go func() {
-		defer waitGroup.Done()
-		models, errProbe := c.probeV3Config(region, codeBuddyIDEUA)
-		record(true, models, errProbe)
-	}()
-
-	if region.IsGlobal() {
-		// /v3/config（CLI UA）：仅 global。独有的 deepseek 系模型只在这条路上。
+	// probe 并发执行一路探测；其中的 panic 记为这一路的错误，其余路照常合并。
+	probe := func(primary bool, scope string, fetch func() ([]ModelInfo, error)) {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			models, errProbe := c.probeV3Config(region, codeBuddyCLIUA)
-			record(true, models, errProbe)
+			var models []ModelInfo
+			errProbe := safe.Call("workbuddy model probe "+scope, func() error {
+				var errFetch error
+				models, errFetch = fetch()
+				return errFetch
+			})
+			record(primary, models, errProbe)
 		}()
 	}
 
+	// /v3/config（IDE UA）：两域共用，字段最全。
+	probe(true, "v3 ide", func() ([]ModelInfo, error) { return c.probeV3Config(region, codeBuddyIDEUA) })
+
+	if region.IsGlobal() {
+		// /v3/config（CLI UA）：仅 global。独有的 deepseek 系模型只在这条路上。
+		probe(true, "v3 cli", func() ([]ModelInfo, error) { return c.probeV3Config(region, codeBuddyCLIUA) })
+	}
+
 	// 企业模型目录：v3 缺失的 id 由它补齐。
-	waitGroup.Add(1)
-	go func() {
-		defer waitGroup.Done()
-		models, errProbe := c.probeEnterpriseModels(region)
-		record(false, models, errProbe)
-	}()
+	probe(false, "enterprise", func() ([]ModelInfo, error) { return c.probeEnterpriseModels(region) })
 
 	waitGroup.Wait()
 

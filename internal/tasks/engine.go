@@ -18,6 +18,7 @@ import (
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -77,6 +78,8 @@ func (s *Service) runTaskBatch(ctx context.Context, kinds []string) {
 		waitGroup.Add(1)
 		go func(name string) {
 			defer waitGroup.Done()
+			// 单个任务族出错只影响自己：不拖垮调度循环，也不拖垮宿主进程。
+			defer safe.Recover("scheduled task " + name)
 			s.runScheduledTaskContext(ctx, name)
 		}(kind)
 	}
@@ -472,7 +475,13 @@ func (s accountScan) MarshalJSON() ([]byte, error) {
 // scanAllAccounts 并发扫描每个账号的待办任务。
 func (s *Service) scanAllAccounts(ctx context.Context, callbackID string) []accountScan {
 	loaded := s.collectAccounts(ctx, callbackID, nil)
-	scans := auth.RunBatch(loaded, queueMaxConcurrency, func(account *accountContext) accountScan {
+	scans := auth.RunBatch(loaded, queueMaxConcurrency, func(account *accountContext) (scan accountScan) {
+		defer func() {
+			if r := recover(); r != nil {
+				scan = accountScan{UID: account.uid(), Label: account.label(),
+					Error: safe.NewPanicError("task scan "+account.label(), r).Error()}
+			}
+		}()
 		return s.scanOneAccount(ctx, account)
 	})
 	sort.Slice(scans, func(i, j int) bool { return scans[i].Label < scans[j].Label })
@@ -594,6 +603,8 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 		}
 		s.queue.mu.Unlock()
 	}()
+	// 先于上面的收尾执行：恢复 panic 后 running 照常复位，队列不会永远卡在「执行中」。
+	defer safe.Recover("task queue")
 
 	ctx := context.Background()
 	loaded := s.collectAccounts(ctx, callbackID, nil)
@@ -611,10 +622,6 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 		grouped[item.UID] = append(grouped[item.UID], index)
 	}
 
-	type queueJob struct {
-		account *accountContext
-		indices []int
-	}
 	jobs := make([]queueJob, 0, len(order))
 	for _, uid := range order {
 		account, okAccount := byUID[uid]
@@ -626,33 +633,55 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 	}
 
 	auth.RunBatch(jobs, concurrency, func(job queueJob) struct{} {
-		target := job.account
-		if errLock := s.lockAccount(ctx, target.uid()); errLock != nil {
-			s.markQueueItems(job.indices, "skipped", "等待该账号的其它任务超时："+errLock.Error(), 0, 0)
-			return struct{}{}
-		}
-		defer s.unlockAccount(target.uid())
-
-		if preparer, okPreparer := core.As[core.TaskPreparer](target.vendor); okPreparer {
-			if accepted := preparer.PrepareTasks(ctx, target.credential); accepted > 0 {
-				logger.Debug("queue: accepted %d task(s) for %s", accepted, target.label())
-				core.SleepContext(ctx, 1050*time.Millisecond)
-			}
-		}
-		for _, index := range job.indices {
-			item := s.queueItemAt(index)
-			s.markQueueItem(index, "running", "")
-			result, errRun := s.runTaskForAccount(ctx, target, item.Code)
-			if errRun != nil {
-				s.markQueueItem(index, "error", errRun.Error())
-			} else {
-				s.setQueueItemResult(index, result.Status, result.Message, result.Credit, result.Energy)
-			}
-			core.SleepContext(ctx, 1050*time.Millisecond)
-		}
+		s.runQueueJob(ctx, job)
 		return struct{}{}
 	})
 	logger.Info("task queue finished (seq=%d)", seq)
+}
+
+// queueJob 是队列里同一账号的一组条目，组内串行执行。
+type queueJob struct {
+	account *accountContext
+	indices []int
+}
+
+// runQueueJob 串行执行一个账号的队列条目。
+func (s *Service) runQueueJob(ctx context.Context, job queueJob) {
+	target := job.account
+	// unfinished 是本账号还没给出结果的条目。panic 时把它们标为失败（其它账号
+	// 照常继续），而不是让页面永远显示「执行中」。
+	unfinished := job.indices
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr := safe.NewPanicError("task queue "+target.label(), r)
+			s.markQueueItems(unfinished, "error", panicErr.Error(), 0, 0)
+		}
+	}()
+	if errLock := s.lockAccount(ctx, target.uid()); errLock != nil {
+		s.markQueueItems(job.indices, "skipped", "等待该账号的其它任务超时："+errLock.Error(), 0, 0)
+		return
+	}
+	defer s.unlockAccount(target.uid())
+
+	if preparer, okPreparer := core.As[core.TaskPreparer](target.vendor); okPreparer {
+		if accepted := preparer.PrepareTasks(ctx, target.credential); accepted > 0 {
+			logger.Debug("queue: accepted %d task(s) for %s", accepted, target.label())
+			core.SleepContext(ctx, 1050*time.Millisecond)
+		}
+	}
+	for position, index := range job.indices {
+		unfinished = job.indices[position:]
+		item := s.queueItemAt(index)
+		s.markQueueItem(index, "running", "")
+		result, errRun := s.runTaskForAccount(ctx, target, item.Code)
+		if errRun != nil {
+			s.markQueueItem(index, "error", errRun.Error())
+		} else {
+			s.setQueueItemResult(index, result.Status, result.Message, result.Credit, result.Energy)
+		}
+		unfinished = job.indices[position+1:]
+		core.SleepContext(ctx, 1050*time.Millisecond)
+	}
 }
 
 // runTaskForAccount 调用供应商的任务执行能力并记录结果。
@@ -815,7 +844,13 @@ func pickAccount(candidates []*accountContext, identifier string) *accountContex
 // activityStatusForAccounts 返回各账号的活动任务状态（供管理页展示）。
 func (s *Service) activityStatusForAccounts(ctx context.Context, callbackID string) []map[string]any {
 	loaded := s.collectAccounts(ctx, callbackID, nil)
-	out := auth.RunBatch(loaded, queueMaxConcurrency, func(target *accountContext) map[string]any {
+	out := auth.RunBatch(loaded, queueMaxConcurrency, func(target *accountContext) (result map[string]any) {
+		defer func() {
+			if r := recover(); r != nil {
+				result = map[string]any{"uid": target.uid(), "label": target.label(), "in_period": false,
+					"error": safe.NewPanicError("task status "+target.label(), r).Error()}
+			}
+		}()
 		entry := map[string]any{
 			"uid":   target.uid(),
 			"label": target.label(),

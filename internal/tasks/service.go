@@ -6,6 +6,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"freetier2api-plugin/internal/safe"
 )
 
 // Service 是一个 App 实例的任务引擎。
@@ -59,6 +61,7 @@ func (s *Service) trackJob(run func(ctx context.Context)) {
 		if tracked {
 			defer s.jobWG.Done()
 		}
+		defer safe.Recover("task job")
 		run(ctx)
 	}()
 }
@@ -94,6 +97,7 @@ func (s *Service) Start(ctx context.Context) {
 	s.schedulerWG.Add(1)
 	go func() {
 		defer s.schedulerWG.Done()
+		defer safe.Recover("task scheduler")
 		s.runTaskScheduler(runCtx)
 	}()
 }

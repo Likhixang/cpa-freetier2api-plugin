@@ -9,6 +9,7 @@ import (
 	accountpkg "freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/safe"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -156,7 +157,7 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	}
 	done, owner := s.acquireQuotaRun()
 	if owner {
-		go s.runQuotaBatch(done, jobs)
+		safe.Go("quota batch", func() { s.runQuotaBatch(done, jobs) })
 	}
 	select {
 	case <-done:
@@ -223,6 +224,14 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 				return
 			}
 			s.cacheQuotaResult(result)
+		}()
+		// 先于上面的缓存 defer 执行：panic 也写一条带原因的失败结果进缓存，
+		// 账号表不会停在「查询中…」。
+		defer func() {
+			if r := recover(); r != nil {
+				outcome = quotaBatchOutcome{result: current.identity()}
+				outcome.result.Message = safe.NewPanicError("quota "+outcome.result.UID, r).Error()
+			}
 		}()
 		quota, errQuota := s.queryQuota(ctx, current)
 		if errQuota != nil {

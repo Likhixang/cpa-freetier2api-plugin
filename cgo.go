@@ -69,6 +69,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 )
 
 // hostAPI 保存宿主在 cliproxy_plugin_init 传入的函数表指针。
@@ -96,12 +97,27 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 // 注意错误处理约定：业务错误既写进响应信封（让调用方能读到 code/message），
 // 也返回非 0 code。宿主两者都会看——信封给上层，code 给 C 层。
 //
+// panic 绝不能穿过这里：它会让整个宿主进程退出。业务处理走 handleMethodSafe（转成
+// internal_error 响应）；下面的 defer 再兜住入口自身（取参、写响应）的意外。
+//
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (code C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr := safe.NewPanicError("plugin call entry", r)
+			if response != nil && response.ptr != nil {
+				C.free(response.ptr)
+				response.ptr = nil
+				response.len = 0
+			}
+			writeResponse(response, core.ErrorEnvelope(internalErrorCode, panicErr.Error()))
+			code = 1
+		}
+	}()
 	if method == nil {
 		writeResponse(response, core.ErrorEnvelope("invalid_method", "method is required"))
 		return 1
@@ -112,7 +128,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, core.ErrorEnvelopeFromError(errRequest))
 		return 1
 	}
-	raw, errHandle := handleMethod(methodName, requestBytes)
+	raw, errHandle := handleMethodSafe(methodName, requestBytes)
 	if errHandle != nil {
 		writeResponse(response, core.ErrorEnvelopeFromError(errHandle))
 		return 1

@@ -22,6 +22,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/safe"
 	"freetier2api-plugin/internal/tasks"
 )
 
@@ -115,6 +116,9 @@ func (a *App) handleExecutorExecuteStream(request []byte) ([]byte, error) {
 	streamCtx, cancelStream, finishStream := a.BeginPluginStream()
 	go func() {
 		defer finishStream()
+		// 兜底：runStreamExecution 已把供应商代码的 panic 转成错误帧，这里再挡住
+		// 收尾阶段（closeStream）的意外，避免拖垮宿主进程。
+		defer safe.Recover("stream " + prepared.rpc.StreamID)
 		a.runStreamExecution(streamCtx, cancelStream, prepared)
 	}()
 
@@ -152,13 +156,25 @@ func (a *App) runStreamExecution(streamCtx context.Context, cancelStream context
 		streamID:     streamID,
 		cancelStream: cancelStream,
 	}
-	errForward := prepared.vendor.ExecuteStream(ctx, prepared.credential, prepared.executeRequest(), sink)
+	errForward := executeStreamSafe(ctx, prepared, sink)
 	// 下游主动断开会取消上下文，那不是错误，不该发错误帧给客户端。
 	if errForward != nil && streamCtx.Err() == nil {
 		closeStream(callbackID, streamID, errForward)
 		return
 	}
 	closeStream(callbackID, streamID, nil)
+}
+
+// executeStreamSafe 调用供应商的流式实现，把其中的 panic 转成 internal_error（HTTP 500、
+// 不可重试）：客户端收到一条错误帧、宿主正常收流，而不是整个宿主进程退出。
+func executeStreamSafe(ctx context.Context, prepared preparedExecution, sink core.StreamSink) (errForward error) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr := safe.NewPanicError("stream "+prepared.rpc.StreamID, r)
+			errForward = core.NewPluginError("internal_error", panicErr.Error(), http.StatusInternalServerError)
+		}
+	}()
+	return prepared.vendor.ExecuteStream(ctx, prepared.credential, prepared.executeRequest(), sink)
 }
 
 // hostStreamSink 把宿主的流式投递能力包装成 core.StreamSink。
