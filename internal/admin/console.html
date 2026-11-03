@@ -431,7 +431,7 @@ details.fold > div { padding: 0 0 8px; }
       <span class="brand-mark" aria-hidden="true"></span>
       <div class="brand-text">
         <h1>FreeTier 2API</h1>
-        <div class="sub">WorkBuddy / Qoder 账号、额度、模型与任务管理 · 本地零凭证存储</div>
+        <div class="sub" id="headerSub">多供应商账号、额度、模型与任务管理 · 本地零凭证存储</div>
       </div>
     </div>
     <nav class="tabs" aria-label="页面分区">
@@ -1101,6 +1101,12 @@ details.fold > div { padding: 0 0 8px; }
         menu.appendChild(item);
       });
       vendorsLoaded = true;
+      // 副标题按实际注册的供应商生成，新增供应商时不会再过时；完整名单放在悬停提示里。
+      var sub = document.getElementById("headerSub");
+      if (sub && list.length) {
+        sub.textContent = list.length + " 家供应商的账号、额度、模型与任务管理 · 本地零凭证存储";
+        sub.title = list.map(function (vendor) { return vendor.name || vendor.id; }).join(" / ");
+      }
       return list;
     }).catch(function (err) {
       // 供应商列表拉不到不该让整页失效：账号表退化成显示原始 id。
@@ -2411,7 +2417,8 @@ details.fold > div { padding: 0 0 8px; }
       if (!snapshot.running && queueTimer) {
         clearInterval(queueTimer); queueTimer = null;
         banner("ok", "队列执行结束");
-        loadStatus();
+        // 带 true：刷新账号表时不清掉刚弹出的结束提示。
+        loadStatus(true);
       }
     }).catch(function () { /* 轮询失败静默 */ });
   }
@@ -3389,7 +3396,8 @@ details.fold > div { padding: 0 0 8px; }
       // 渠道标识改变对外模型 ID，保存后立刻重载宿主配置重建注册表，
       // 与别名/禁用共用同一条同步通道，不必等页面重进或重启宿主。
       if (data && data.model_registry_dirty) { syncModelConfig(); }
-      loadStatus();
+      // 带 true：刷新状态时不清掉「设置已保存并生效」。
+      loadStatus(true);
     }).catch(function (err) { banner("err", err.message); });
   });
   document.getElementById("btnLogs").addEventListener("click", function () { loadLogs(true); });
