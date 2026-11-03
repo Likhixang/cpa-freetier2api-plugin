@@ -939,59 +939,67 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 
 		// 建流成功：进入流式读取，不再在本层重试
 		defer resp.Body.Close()
-		lineCh := make(chan string)
-		errCh := make(chan error, 1)
-		// done：主循环提前退出（onLine 返回 false）时关闭，解锁 scanner goroutine，
-		// 避免其阻塞在 lineCh 发送处、仅剩 ctx.Done 一条出路造成 goroutine 泄漏
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			// 读流协程里的 panic 转成本次请求的错误（errCh 有 1 格缓冲，且此前
-			// 不会有其它发送），而不是让宿主进程退出。
-			defer func() {
-				if r := recover(); r != nil {
-					errCh <- safe.NewPanicError("qoder stream reader", r)
-				}
-			}()
-			scanner := bufio.NewScanner(resp.Body)
-			scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
-			for scanner.Scan() {
-				select {
-				case lineCh <- scanner.Text():
-				case <-ctx.Done():
-					errCh <- ctx.Err()
-					return
-				case <-done:
-					return
-				}
+		return readQoderStream(ctx, resp.Body, onLine)
+	}
+	// 防御性兜底：所有失败分支均在循环内直接 return，正常不可达
+	return WrapTransportError(lastErr)
+}
+
+// readQoderStream 按行读取已建立的流式响应，逐行交给 onLine（空行跳过）。
+// onLine 返回 false 时立即停止读取；ctx 取消时返回 ctx.Err()。
+func readQoderStream(ctx context.Context, body io.Reader, onLine func(string) bool) error {
+	lineCh := make(chan string)
+	errCh := make(chan error, 1)
+	// done：主循环提前退出（onLine 返回 false）时关闭，解锁 scanner goroutine，
+	// 避免其阻塞在 lineCh 发送处、仅剩 ctx.Done 一条出路造成 goroutine 泄漏
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		// 读流协程里的 panic 转成本次请求的错误（errCh 有 1 格缓冲，且此前
+		// 不会有其它发送），而不是让宿主进程退出。
+		defer func() {
+			if r := recover(); r != nil {
+				errCh <- safe.NewPanicError("qoder stream reader", r)
 			}
-			if err := scanner.Err(); err != nil {
-				errCh <- err
+		}()
+		scanner := bufio.NewScanner(body)
+		// 单行上限与其它供应商统一（8 MiB）：大的工具调用参数可能整段落在一行里，
+		// 超限会报 bufio.ErrTooLong 并中断整条流。
+		scanner.Buffer(make([]byte, 0, 64*1024), hostbridge.SSEScannerBuffer)
+		for scanner.Scan() {
+			select {
+			case lineCh <- scanner.Text():
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case <-done:
 				return
 			}
-			errCh <- nil
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case err := <-errCh:
-				logger.Debug("stream read complete")
-				return err
-			case line := <-lineCh:
-				if line != "" {
-					// onLine 返回 false：消费方已置位 upstreamErr（信封错误帧），
-					// 立即停止读取，避免上游不关流时请求挂起；
-					// 错误由 CallQoderWithOpts 的 emitted 闸门 + isRetryableStreamError 完成重开
-					if !onLine(line) {
-						return nil
-					}
+		}
+		if err := scanner.Err(); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			logger.Debug("stream read complete")
+			return err
+		case line := <-lineCh:
+			if line != "" {
+				// onLine 返回 false：消费方已置位 upstreamErr（信封错误帧），
+				// 立即停止读取，避免上游不关流时请求挂起；
+				// 错误由 CallQoderWithOpts 的 emitted 闸门 + isRetryableStreamError 完成重开
+				if !onLine(line) {
+					return nil
 				}
 			}
 		}
 	}
-	// 防御性兜底：所有失败分支均在循环内直接 return，正常不可达
-	return WrapTransportError(lastErr)
 }
 
 // ExchangeJobToken 将 PAT 或 refresh token 转换为 job token。
