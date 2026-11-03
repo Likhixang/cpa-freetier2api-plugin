@@ -8,6 +8,9 @@ A native dynamic library plugin that connects multiple free-tier AI providers to
 
 [中文](README.md) | English
 
+> **About this Repository**  
+> This is a self-maintained version based on [CLIProxyAPI-freetier2api-plugin](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin) created by [jiandanc](https://github.com/jiandanc). Sincere thanks to the original author and repository for their foundational design and contributions.
+
 If this project helps you, a Star would mean a lot.
 
 > **⚠️ Important Compliance Notice**: This project is **strictly for personal learning and technical research only**. Commercial sale, API resale, paid account farming, public/paid shared pools, or any use violating upstream Terms of Service or applicable laws is strictly prohibited. Each provider is hard-limited to a maximum of **10 accounts**. By using this software, you agree to the [Disclaimer](#disclaimer) below.
@@ -53,7 +56,7 @@ This plugin is listed in the official CLIProxyAPI plugin registry:
 
 ### Option 2: Manual Installation from Releases
 
-Download the archive for your platform from [Releases](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin/releases), extract the shared library (`freetier2api.so` / `freetier2api.dylib` / `freetier2api.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
+Download the archive for your platform from [Releases](https://github.com/Likhixang/cpa-freetier2api-plugin/releases), extract the shared library (`freetier2api.so` / `freetier2api.dylib` / `freetier2api.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
 
 ```yaml
 plugins:
@@ -70,7 +73,7 @@ plugins:
 Requires Go 1.22+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
 
 ```bash
-git clone https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin.git
+git clone https://github.com/Likhixang/cpa-freetier2api-plugin.git
 cd CLIProxyAPI-freetier2api-plugin
 ./scripts/build.sh
 ```
@@ -168,6 +171,7 @@ package main / cgo        C ABI entry (main.go / cgo.go)
 
 This project references or adapts protocol designs, ABI contracts, and metadata from the following open-source projects:
 
+- **[jiandanc/CLIProxyAPI-freetier2api-plugin](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin)** (MIT): Foundational architecture and initial implementation of the FreeTier 2API plugin.
 - **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** (MIT): Host plugin ABI/API contracts (`cpasdk/`) and HTTP/SSE bridge design.
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** & **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)** (MIT): WorkBuddy protocol adaptation, prompt sanitization, and task system reference.
 - **[aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API)**: AutoClaw and Raccoon protocol adaptation (header set/signing, proxy channel, authorize login, model catalog, points & check-in semantics) reference.
