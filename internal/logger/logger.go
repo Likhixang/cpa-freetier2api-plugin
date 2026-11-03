@@ -273,10 +273,7 @@ func Snapshot(since uint64, limit int) ([]Entry, uint64) {
 		if start < 0 {
 			start = 0
 		}
-		for _, entry := range all[start:] {
-			out = append(out, entry)
-		}
-		return out, newest
+		return append(out, all[start:]...), newest
 	}
 	for _, entry := range all {
 		if entry.Seq <= since {

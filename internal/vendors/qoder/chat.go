@@ -790,11 +790,7 @@ func PathSigFrom(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	p := u.Path
-	if strings.HasPrefix(p, "/algo") {
-		p = p[len("/algo"):]
-	}
-	return p, nil
+	return strings.TrimPrefix(u.Path, "/algo"), nil
 }
 
 // shortResponseMaxBytes 是 Qoder 短响应（模型目录、额度、签到、换取 jobToken、

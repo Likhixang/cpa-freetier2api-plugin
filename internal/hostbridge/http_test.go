@@ -120,11 +120,11 @@ func TestStreamBodyEmptyChunksHonorContextCancellation(t *testing.T) {
 
 // TestWithCallbackID 验证回调 ID 的绑定与读取。
 func TestWithCallbackID(t *testing.T) {
-	if got := CallbackID(WithCallbackID(nil, "cb-1")); got != "cb-1" {
+	if got := CallbackID(WithCallbackID(context.TODO(), "cb-1")); got != "cb-1" {
 		t.Fatalf("callback id = %q, want cb-1", got)
 	}
 	// 空 ID 不写入 context（保持零值语义）。
-	if got := CallbackID(WithCallbackID(nil, "   ")); got != "" {
+	if got := CallbackID(WithCallbackID(context.TODO(), "   ")); got != "" {
 		t.Fatalf("blank callback id must not be stored, got %q", got)
 	}
 }

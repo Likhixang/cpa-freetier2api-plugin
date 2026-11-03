@@ -4,20 +4,30 @@ package hostbridge
 // 注入后的调用转发与并发计数。
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
 )
 
 func TestCallbackIDBinding(t *testing.T) {
-	ctx := WithCallbackID(nil, "cb-1")
+	ctx := WithCallbackID(context.TODO(), "cb-1")
 	if got := CallbackID(ctx); got != "cb-1" {
 		t.Fatalf("callback id = %q, want cb-1", got)
 	}
 	// 空 ID 不写入 context。
-	if got := CallbackID(WithCallbackID(nil, "   ")); got != "" {
+	if got := CallbackID(WithCallbackID(context.TODO(), "   ")); got != "" {
 		t.Fatalf("blank callback id must not be stored, got %q", got)
 	}
+}
+
+// TestCallbackIDToleratesNilContext 锁定生产代码对 nil context 的兼容处理，所以刻意传 nil。
+func TestCallbackIDToleratesNilContext(t *testing.T) {
+	//lint:ignore SA1012 刻意验证 nil context 的兼容处理
+	if got := CallbackID(WithCallbackID(nil, "cb-nil")); got != "cb-nil" {
+		t.Fatalf("WithCallbackID(nil) must fall back to Background, got %q", got)
+	}
+	//lint:ignore SA1012 刻意验证 nil context 的兼容处理
 	if got := CallbackID(nil); got != "" {
 		t.Fatalf("nil context must yield empty id, got %q", got)
 	}
@@ -42,7 +52,7 @@ func TestCallForwardsAndCountsInflight(t *testing.T) {
 	})
 	t.Cleanup(func() { Configure(nil) })
 
-	ctx := WithCallbackID(nil, "cb-2")
+	ctx := WithCallbackID(context.TODO(), "cb-2")
 	if _, errCall := CallCtx(ctx, "host.test", map[string]any{"k": "v"}); errCall != nil {
 		t.Fatalf("call: %v", errCall)
 	}
