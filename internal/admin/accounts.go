@@ -534,7 +534,7 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 		}
 		rawJSON = encoded
 		if seed == "" {
-			seed = maskedAPIKey(apiKey)
+			seed = core.MaskKey(apiKey)
 		}
 	}
 	if seed == "" {
@@ -553,18 +553,6 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	}
 	logger.Info("added auth file %s for vendor %s", fileName, vendor.ID())
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "auth_id": fileName, "message": "账号保存成功"})
-}
-
-// maskedAPIKey 生成 API Key 的脱敏种子（Cline/OpenCode ZEN 等 key 型凭证）。
-func maskedAPIKey(key string) string {
-	trimmed := strings.TrimSpace(key)
-	if len(trimmed) <= 8 {
-		if trimmed == "" {
-			return ""
-		}
-		return "***"
-	}
-	return trimmed[:4] + "***" + trimmed[len(trimmed)-4:]
 }
 
 // accountAliasRequest 是设置/清除账号别名的请求体。

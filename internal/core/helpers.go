@@ -258,6 +258,23 @@ func jwtPayload(token string) []byte {
 	return nil
 }
 
+// MaskKey 返回 key 的脱敏形式：保留前四位与后四位，中间固定用 *** 代替；
+// 8 字节及以下的 key 全遮成 ***（露出前后四位等于露出全部），空串返回空串。
+//
+// 用于 key 型凭证的展示名兜底与凭证文件名种子——**绝不**把完整 key 放进
+// Label：Label 会进日志、管理接口响应和页面。注意结果参与生成凭证文件名，
+// 输出格式改变会让同一个 key 生成不同的文件名，改动前务必保持逐字兼容。
+func MaskKey(key string) string {
+	trimmed := strings.TrimSpace(key)
+	if len(trimmed) <= 8 {
+		if trimmed == "" {
+			return ""
+		}
+		return "***"
+	}
+	return trimmed[:4] + "***" + trimmed[len(trimmed)-4:]
+}
+
 // MaskToken 返回脱敏后的 token（展示用）：保留前 4 后 4 位，中间用 * 填充。
 // 不超过 8 位时全部遮挡；空值返回空串。
 func MaskToken(token string) string {

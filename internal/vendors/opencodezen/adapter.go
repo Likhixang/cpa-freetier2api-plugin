@@ -50,7 +50,7 @@ func Instances(env core.Env) []core.Vendor {
 				}
 				label := native.Label
 				if label == "" {
-					label = MaskedKey(native.APIKey)
+					label = core.MaskKey(native.APIKey)
 				}
 				return core.CredentialSeed{
 					VendorID: VendorID, Label: label, FileID: core.FileIDFromFileName(fileName),

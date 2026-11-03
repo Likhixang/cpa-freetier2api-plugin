@@ -1,6 +1,7 @@
 package opencodezen
 
 import (
+	"freetier2api-plugin/internal/core"
 	"testing"
 )
 
@@ -51,16 +52,9 @@ func TestParseCredential(t *testing.T) {
 	}
 }
 
-func TestMaskedKey(t *testing.T) {
-	// 12 位：保留前 4 与后 4。
-	if got := MaskedKey("abcdefghijkl"); got != "abcd***ijkl" {
-		t.Fatalf("MaskedKey = %q, want abcd***ijkl", got)
-	}
-	// 恰好 8 位：露出前后四位等于露出全部，因此全遮。
-	if got := MaskedKey("12345678"); got != "***" {
-		t.Fatalf("8-char MaskedKey = %q, want ***", got)
-	}
-	if got := MaskedKey(""); got != "" {
-		t.Fatalf("empty MaskedKey = %q", got)
+// 展示名兜底改用 core.MaskKey（原 MaskedKey 已合并过去）：Label 里不出现完整 key。
+func TestAPIKeyLabelUsesMaskKey(t *testing.T) {
+	if got := core.MaskKey("abcdefghijkl"); got != "abcd***ijkl" {
+		t.Fatalf("MaskKey = %q, want abcd***ijkl", got)
 	}
 }
