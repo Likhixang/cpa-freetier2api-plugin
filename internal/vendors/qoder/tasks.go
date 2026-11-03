@@ -785,7 +785,7 @@ func campaignAchievementBlocked(campaign *campaignInfo) bool {
 // 身份时不能笼统地说「无可用签到活动」——那会让用户以为今天本来就没活动。
 func noCampaignMessage(region Region, identity MachineIdentity) string {
 	if region == RegionGlobal && !identity.Native() {
-		return "国际版活动只下发给登录过官方客户端的设备；请在该机器上运行 runtime-info，把输出的 machineToken/machineType 填入凭证或插件配置"
+		return "无可用签到活动：" + MachineIdentityHint(region)
 	}
 	return "无可用签到活动"
 }

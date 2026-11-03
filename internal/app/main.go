@@ -62,6 +62,9 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return a.handlePluginReconfigure(request)
 	case pluginabi.MethodPluginQuiesce:
 		a.StopBackgroundWork()
+		// quiesce 之后宿主可能立刻卸载动态库：队列里剩下的日志必须在这里落盘，
+		// 否则关停前最后几条（往往正是关停原因）会丢。
+		logger.CloseHostSink()
 		return core.OKEnvelope(struct{}{})
 
 	case pluginabi.MethodModelRegister:
@@ -214,6 +217,9 @@ func (a *App) configFields() []pluginapi.ConfigField {
 		{Name: "state_dir", Type: pluginapi.ConfigFieldTypeString, Description: "插件状态目录。"},
 		{Name: "log_level", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"debug", "info", "error"}, Description: "插件日志级别。"},
 		{Name: "log_to_file", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否把日志写入 <state_dir>/logs。"},
+		{Name: "log_to_host", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否把插件日志镜像进宿主 main.log（宿主面板的日志页只读该文件）。默认开启。"},
+		{Name: "host_log_file", Type: pluginapi.ConfigFieldTypeString, Description: "宿主 main.log 路径。留空时按状态目录自动探测 <auth-dir>/logs/main.log。"},
+		{Name: "host_log_level", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"debug", "info", "error"}, Description: "镜像进宿主日志的最低级别，默认 info。"},
 		{Name: "auto_checkin", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否每日自动签到。"},
 		{Name: "auto_checkin_at", Type: pluginapi.ConfigFieldTypeString, Description: "自动签到时间（HH:MM）。"},
 		{Name: "auto_tasks", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否每日自动跑任务闭环。"},

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -328,6 +329,260 @@ func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind 
 	return SummarizeUG(results), nil
 }
 
+// ---- 一键任务 ----
+
+// AutoTaskCodeUG 是一键任务里「活动福利」那一行的任务码。
+const AutoTaskCodeUG = "(活动福利)"
+
+// ugTaskTitle 是聚合活动任务在扫描结果里显示的名字。
+const ugTaskTitle = "活动福利领取"
+
+// RunTask 执行单条任务。
+//
+// 认三种任务码：签到、聚合活动领取、以及动作表里的单个端点 key。其余一律
+// 按「该供应商没有这条任务」返回 skipped，避免静默成功。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.BuildCheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+		}
+		return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+	}
+	if trimmed == AutoTaskCodeUG {
+		return v.runUGTask(ctx, cred)
+	}
+	// 单个端点也能按 key 点名执行：固定端点没有读取接口，扫描产不出具体条目，
+	// 只能由控制台/用户按 key 触发。
+	if endpoint, okEndpoint := ugEndpointByKey(trimmed); okEndpoint {
+		return v.runUGEndpoint(ctx, cred, endpoint)
+	}
+	return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+}
+
+// RunAllTasks 执行一键任务：先签到，再领活动中心/裂变/比赛的活动奖励。
+//
+// 活动福利全部挂在 UG 端点上，与定时排程的 ug 族是同一套调用；这里只是把它
+// 接进一键任务，让用户不用等排程也能立刻把能领的领掉。领取本身幂等。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	if !v.SupportsCheckin() {
+		return nil
+	}
+	results := make([]core.AutoTaskResult, 0, 2)
+	if row := core.BuildCheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{
+			Code:    AutoTaskCodeUG,
+			Status:  core.AutoStatusError,
+			Message: core.ToPluginError(errNative).Error(),
+		})
+	}
+	ugResults, errClaim := ClaimUG(ctx, native, v.profile())
+	status, message := ugAutoStatus(ugResults)
+	if errClaim != nil {
+		if len(ugResults) == 0 {
+			return append(results, core.AutoTaskResult{
+				Code:    AutoTaskCodeUG,
+				Status:  core.AutoStatusError,
+				Message: core.ToPluginError(errClaim).Error(),
+			})
+		}
+		// 部分成功：已拿到的战果照常展示，只把错误附在后面。
+		message += "；" + core.ToPluginError(errClaim).Error()
+	}
+	return append(results, core.AutoTaskResult{Code: AutoTaskCodeUG, Status: status, Message: message})
+}
+
+// runUGTask 领一轮活动福利，返回三态结果。
+func (v *adapter) runUGTask(ctx context.Context, cred *core.Credential) (core.TaskRunResult, error) {
+	if !v.SupportsCheckin() {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该区域没有活动福利"}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskRunResult{}, errNative
+	}
+	results, errClaim := ClaimUG(ctx, native, v.profile())
+	status, message := ugAutoStatus(results)
+	if errClaim != nil {
+		if len(results) == 0 {
+			return core.TaskRunResult{Status: core.AutoStatusError, Message: core.ToPluginError(errClaim).Error()}, nil
+		}
+		message += "；" + core.ToPluginError(errClaim).Error()
+	}
+	return core.TaskRunResult{Status: status, Message: message}, nil
+}
+
+// runUGEndpoint 执行动作表里的单个端点。
+func (v *adapter) runUGEndpoint(ctx context.Context, cred *core.Credential, endpoint UGEndpoint) (core.TaskRunResult, error) {
+	if !v.SupportsCheckin() {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该区域没有活动福利"}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskRunResult{}, errNative
+	}
+	headers, errHeaders := checkinHeaders(native)
+	if errHeaders != nil {
+		return core.TaskRunResult{Status: core.AutoStatusError, Message: errHeaders.Error()}, nil
+	}
+	result, errRun := endpoint.Run(ctx, v.profile(), headers, endpoint)
+	if errRun != nil {
+		return core.TaskRunResult{Status: core.AutoStatusError, Message: core.ToPluginError(errRun).Error()}, nil
+	}
+	return core.TaskRunResult{Status: ugResultAutoStatus(result), Message: result.Describe()}, nil
+}
+
+// ugAutoStatus 把一轮 UG 结果压成三态 + 一行文案。
+//
+// 领到东西才算 done；只有失败才算 error；已领过、暂不可领、待满足前置都算
+// skipped——把它们记成 error 会让正常账号在日志里天天刷红。
+func ugAutoStatus(results []UGResult) (string, string) {
+	if len(results) == 0 {
+		return core.AutoStatusSkipped, "没有可领取的活动入口"
+	}
+	var claimed, failed, already int
+	for _, result := range results {
+		switch result.Status {
+		case UGClaimed:
+			claimed++
+		case UGAlready:
+			already++
+		case UGFailed:
+			failed++
+		}
+	}
+	message := SummarizeUG(results)
+	switch {
+	case claimed > 0:
+		return core.AutoStatusDone, message
+	case failed > 0 && already == 0:
+		return core.AutoStatusError, message
+	default:
+		return core.AutoStatusSkipped, message
+	}
+}
+
+// ugResultAutoStatus 把单条结果映射成三态。
+func ugResultAutoStatus(result UGResult) string {
+	switch result.Status {
+	case UGClaimed:
+		return core.AutoStatusDone
+	case UGFailed:
+		return core.AutoStatusError
+	default:
+		return core.AutoStatusSkipped
+	}
+}
+
+// ---- 任务扫描与活动状态 ----
+
+// InspectTasks 扫描账号当前可领的活动福利。
+//
+// 只报「上游明确说可领且还没发」的活动：签到走专用接口（见 TaskStatus 的
+// 状态行），需要用户先在自己客户端里做前置动作的活动插件替不了，报出来只是
+// 一行永远不变的提示。多条可领活动聚合成一次调用（RunCode），队列只入队一次。
+func (v *adapter) InspectTasks(ctx context.Context, cred *core.Credential) (core.TaskInspection, error) {
+	if !v.SupportsCheckin() {
+		return core.TaskInspection{}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskInspection{}, errNative
+	}
+	headers, errHeaders := checkinHeaders(native)
+	if errHeaders != nil {
+		return core.TaskInspection{}, errHeaders
+	}
+	activities, errActivities := fetchUGActivities(ctx, v.profile(), headers)
+	if errActivities != nil {
+		return core.TaskInspection{}, core.ToPluginError(errActivities)
+	}
+	now := time.Now()
+	inspection := core.TaskInspection{}
+	for _, activity := range activities {
+		if !activity.enabled() || activity.expired(now) {
+			continue
+		}
+		inspection.InPeriod = true
+		if !claimableActivity(activity, now) {
+			continue
+		}
+		inspection.Items = append(inspection.Items, core.TaskItem{
+			Kind:    TaskKindUG,
+			Code:    "activity:" + activity.ID,
+			RunCode: AutoTaskCodeUG,
+			Title:   activity.activityTitle(),
+			Target:  1,
+		})
+	}
+	if len(inspection.Items) == 0 {
+		// 竞赛/抽奖这类固定端点没有读取接口，扫不出状态。账号支持活动就给一次
+		// 机会，否则「活动表里没有可领项」会被误读成「今天无事可做」。
+		inspection.Items = append(inspection.Items, core.TaskItem{
+			Kind: TaskKindUG, Code: AutoTaskCodeUG, Title: ugTaskTitle, Target: 1,
+		})
+	}
+	return inspection, nil
+}
+
+// TaskStatus 返回活动任务状态（供控制台展示）。
+//
+// 行 = 每日签到 + 活动表里每一条未结束的活动。状态用短 token 而不是中文：
+// 控制台按它上色/过滤，改文案不该影响判断逻辑。
+func (v *adapter) TaskStatus(ctx context.Context, cred *core.Credential) core.TaskStatusResult {
+	if !v.SupportsCheckin() {
+		return core.TaskStatusResult{Error: "国际版没有活动福利"}
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskStatusResult{Error: errNative.Error()}
+	}
+	headers, errHeaders := checkinHeaders(native)
+	if errHeaders != nil {
+		return core.TaskStatusResult{Error: errHeaders.Error()}
+	}
+	result := core.TaskStatusResult{}
+	// 签到状态预查失败不阻断活动表：两段各报各的，别让一个端点故障抹掉全表。
+	if status, errStatus := fetchCheckinStatus(ctx, v.profile(), headers); errStatus == nil && status != nil {
+		view := core.TaskStatusView{Code: core.AutoTaskCodeCheckin, Title: "每日签到", Target: 1}
+		switch {
+		case !status.Enable:
+			view.Status = "disabled"
+		case status.CheckedIn:
+			view.Status = "checked_in"
+			view.Progress = 1
+		default:
+			view.Status = "pending"
+		}
+		result.Tasks = append(result.Tasks, view)
+		result.InPeriod = status.Enable
+	}
+	activities, errActivities := fetchUGActivities(ctx, v.profile(), headers)
+	if errActivities != nil {
+		result.Error = core.ToPluginError(errActivities).Error()
+		return result
+	}
+	now := time.Now()
+	for _, activity := range activities {
+		if !activity.enabled() || activity.expired(now) {
+			continue
+		}
+		result.InPeriod = true
+		result.Tasks = append(result.Tasks, core.TaskStatusView{
+			Code:   "activity:" + activity.ID,
+			Title:  activity.activityTitle(),
+			Status: activityStatusToken(activity, now),
+			Target: 1,
+		})
+	}
+	return result
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor              = (*adapter)(nil)
@@ -340,4 +595,7 @@ var (
 	_ core.CreditsProvider     = (*adapter)(nil)
 	_ core.TaskCatalogProvider = (*adapter)(nil)
 	_ core.ScheduledRunner     = (*adapter)(nil)
+	_ core.TaskRunner          = (*adapter)(nil)
+	_ core.TaskInspector       = (*adapter)(nil)
+	_ core.TaskStatusProvider  = (*adapter)(nil)
 )

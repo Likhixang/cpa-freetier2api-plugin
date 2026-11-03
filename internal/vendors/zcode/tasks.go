@@ -194,6 +194,12 @@ func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.
 			response.Summary = append(response.Summary, metrics...)
 			response.Groups = append(response.Groups, groups...)
 		}
+	} else if metrics, groups := pendingGrantQuota(snapshot.plans, snapshot.serverTime, snapshot.balances); len(metrics) > 0 {
+		// 日常桶已经有数字时上面那条兜底按契约不参与，而活动授予在 effective_at
+		// 之前同样不会生成桶。「日常桶 + 一笔还没生效的活动授予」正是最常见的
+		// 组合：只按「有没有桶」判断，就会让领到的额度在页面上完全不存在。
+		response.Summary = append(response.Summary, metrics...)
+		response.Groups = append(response.Groups, groups...)
 	}
 	return response, nil
 }
@@ -731,6 +737,69 @@ func planGrantQuota(plans []map[string]any, serverTime int64) ([]pluginapi.Quota
 	return metrics, []pluginapi.QuotaGroup{group}
 }
 
+// pendingGrantQuota 展示「已领取、尚未生效」的活动授予。
+//
+// 日常桶已经给了数字时 balances 非空，planGrantQuota 按契约不参与兜底；而活动
+// 授予在 effective_at 之前同样不会生成桶。「日常桶 + 一笔还没生效的活动授予」
+// 正是最常见的组合，只按「有没有桶」判断，就会让领到的额度在页面上一个数都
+// 没有，用户只能以为没到账。
+//
+// 指标键刻意用 pending_grant 而不是 remaining/total：页头那两个数必须继续反映
+// 当前真正可用的额度，把还没生效的授予算进去会让人以为现在就能用。
+func pendingGrantQuota(plans []map[string]any, serverTime int64, balances []map[string]any) ([]pluginapi.QuotaMetric, []pluginapi.QuotaGroup) {
+	bucketed := bucketedEntitlements(balances)
+	seen := map[string]bool{}
+	group := pluginapi.QuotaGroup{DisplayName: "待生效额度"}
+	var total float64
+	for _, candidate := range grantCandidatePlans(plans, serverTime) {
+		// 只报还没生效的那部分：已生效的授予由 balances 桶自己说话，
+		// 再列一遍就是同一份额度出现两次。
+		if candidate.effectiveAt <= 0 {
+			continue
+		}
+		for _, grant := range parsePlanGrants(candidate.plan) {
+			if grant.Model == "" || grant.Units <= 0 {
+				continue
+			}
+			if grant.ID != "" && bucketed[grant.ID] {
+				continue
+			}
+			key := grant.ID
+			if key == "" {
+				key = grant.Model + "|" + formatTokens(grant.Units)
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			total += grant.Units
+			group.Buckets = append(group.Buckets, pluginapi.QuotaBucket{
+				Window:            grant.Model,
+				RemainingFraction: 1,
+				Description:       formatTokens(grant.Units) + " tokens，" + time.Unix(candidate.effectiveAt, 0).UTC().Format(time.RFC3339) + " 生效",
+			})
+		}
+	}
+	if total <= 0 {
+		return nil, nil
+	}
+	return []pluginapi.QuotaMetric{{Key: "pending_grant", Label: "待生效额度", Value: total}}, []pluginapi.QuotaGroup{group}
+}
+
+// bucketedEntitlements 收集 balances 里已经有额度桶的 entitlement_id。
+//
+// 用 ID 而不是「模型 + 额度」比对：同模型可能同时存在日常桶与活动桶，
+// 按名字比对会把另一份真实授予吞掉。
+func bucketedEntitlements(balances []map[string]any) map[string]bool {
+	ids := make(map[string]bool, len(balances))
+	for _, bucket := range balances {
+		if id := core.RawStringField(bucket, "entitlement_id"); id != "" {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
 // grantCandidate 是参与额度兜底的套餐及其「最早未生效授予时刻」。
 type grantCandidate struct {
 	plan        map[string]any
@@ -905,6 +974,11 @@ func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) (cor
 	if errNative != nil {
 		return core.ActivityProbeResult{}, errNative
 	}
+	return v.probeActivity(ctx, native)
+}
+
+// probeActivity 是 ProbeActivity 的原生凭证版本，供一键任务复用。
+func (v *adapter) probeActivity(ctx context.Context, native *Credential) (core.ActivityProbeResult, error) {
 	if native == nil {
 		return core.ActivityProbeResult{}, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
 	}
@@ -1147,21 +1221,34 @@ func (v *adapter) pickClaimPlan(ctx context.Context, cred *Credential, planID st
 // 与额度路径的 classifyBillingOutcome 同源，但领取多了 1003（已领取，按成功
 // 语义回报页面好让按钮置灰）与 1005（附名额恢复时间）。
 func claimFailure(code int, body map[string]any) error {
-	serverMsg := core.FirstNonEmpty(core.RawStringField(body, "msg"), core.RawStringField(body, "message"))
 	base := classifyBillingOutcome(code, body)
 
 	// 1005 带名额恢复时间：上游在 data.plan.ends_at 下发，页面据此提示何时再试。
-	if code == codeDailyQuotaUsed && serverMsg == "" {
+	if code == codeDailyQuotaUsed {
+		failure := &core.Failure{Kind: core.FailureKindSoftRate, Status: http.StatusTooManyRequests, Msg: base}
 		if nextAt := claimQuotaRecovery(body); nextAt > 0 {
-			return core.NewPluginError(
-				"zcode_claim_quota_used",
-				base+"（名额恢复时间："+formatClaimRecovery(nextAt)+"）",
-				http.StatusTooManyRequests,
-			)
+			failure.Msg = base + "（名额恢复时间：" + formatClaimRecovery(nextAt) + "）"
+			// 上游明示了要等到什么时候：填进 RetryAfter，core.RetryAfterOf 会读它，
+			// 宿主据此发 Retry-After 头，客户端不必自己猜重试节奏。
+			if wait := time.Until(time.UnixMilli(nextAt)); wait > 0 {
+				failure.RetryAfter = wait
+			}
 		}
+		return &claimError{failure}
 	}
 	return core.NewPluginError("zcode_claim_failed", base, http.StatusBadRequest)
 }
+
+// claimError 是领取失败：对外只暴露可读文案（页面直接展示 err.Error()），
+// 对内保留 core.Failure 的分类与等待时长——嵌入让它直接满足 core.UpstreamError，
+// Unwrap 让 errors.As 仍能拿到 *core.Failure（core.RetryAfterOf 走这条路径）。
+type claimError struct {
+	*core.Failure
+}
+
+func (e claimError) Error() string { return e.Failure.Msg }
+
+func (e claimError) Unwrap() error { return e.Failure }
 
 // claimQuotaRecovery 从 1005 响应里取名额恢复时间（毫秒）。
 func claimQuotaRecovery(body map[string]any) int64 {

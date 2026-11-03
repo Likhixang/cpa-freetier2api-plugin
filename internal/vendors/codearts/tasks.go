@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -286,6 +287,23 @@ func fetchAccountInfo(ctx context.Context, cred *Credential) (*accountInfo, erro
 
 // fetchDailyActivity 查询活动列表并挑出每日登录领取条目。
 func fetchDailyActivity(ctx context.Context, cred *Credential) (*opsActivity, error) {
+	activities, errFetch := fetchOpsActivities(ctx, cred)
+	if errFetch != nil {
+		return nil, errFetch
+	}
+	for _, activity := range activities {
+		if activity.Type == OpsDailyLoginType {
+			return activity, nil
+		}
+	}
+	return nil, nil
+}
+
+// fetchOpsActivities 拉取活动列表的全部条目。
+//
+// 签到只吃「每日登录」那一条，一键任务要吃剩下的全部可领活动，所以两边共用
+// 这一份解析：分成两套解析会让「哪些活动算可领」的口径慢慢漂开。
+func fetchOpsActivities(ctx context.Context, cred *Credential) ([]*opsActivity, error) {
 	url := SnapEngineApiHost + EpOpsDelivery + "?channel=" + OpsChannel
 	data, errFetch := signedSnapJSON(ctx, http.MethodGet, url, cred, nil)
 	if errFetch != nil {
@@ -295,20 +313,26 @@ func fetchDailyActivity(ctx context.Context, cred *Credential) (*opsActivity, er
 	if !okItems {
 		return nil, fmt.Errorf("活动列表响应缺少 items 字段")
 	}
+	activities := make([]*opsActivity, 0, len(items))
 	for _, item := range items {
 		record, okRecord := item.(map[string]any)
-		if !okRecord || text(record, "type") != OpsDailyLoginType {
+		if !okRecord {
 			continue
 		}
-		return &opsActivity{
-			CampaignID: identifier(record, "campaignId"),
+		campaignID := identifier(record, "campaignId")
+		if campaignID == "" {
+			// 没有 campaignId 就无法领取，列出来只会制造一条必然失败的行。
+			continue
+		}
+		activities = append(activities, &opsActivity{
+			CampaignID: campaignID,
 			Type:       text(record, "type"),
 			Claimable:  boolValue(record, "claimable"),
 			Status:     text(record, "status"),
 			Amount:     firstInt(record, "benefitAmount", "amount", "creditAmount"),
-		}, nil
+		})
 	}
-	return nil, nil
+	return activities, nil
 }
 
 // signedSnapJSON 发一次 snap-access 签名请求并解开 {code,message,data} 信封。
@@ -358,12 +382,101 @@ func signedSnapJSON(ctx context.Context, method, url string, cred *Credential, b
 		if message == "" {
 			message = fmt.Sprintf("业务码 %v", code)
 		}
-		return nil, fmt.Errorf("snap business error: %s", message)
+		return nil, opsBusinessFailure(int64(code), message)
 	}
 	if data, okData := envelope["data"].(map[string]any); okData {
 		return data, nil
 	}
 	return envelope, nil
+}
+
+// opsBusinessMarkers 是 snap 业务码的语义映射表。
+//
+// 上游把失败塞进 HTTP 200 信封（code != 0）：不分类就只剩一句没有状态的
+// 字符串，宿主既不冷却也不禁用账号。只映射实测见过的语义，表外一律按
+// client（请求/账号状态问题，不罚账号）处理——把它当 transient 会让宿主
+// 拿着一个必然失败的请求反复换号重试。
+var opsBusinessMarkers = []struct {
+	markers []string
+	kind    core.FailureKind
+	status  int
+}{
+	// 登录失效：STS / 会话过期，保活能续期，归 401 让宿主先刷新再重查。
+	{[]string{"not login", "未登录", "login expired", "登录已过期", "security token has expired",
+		"apig.0602", "apig.0301"}, core.FailureKindSessionDead, http.StatusUnauthorized},
+	// 账号被禁用 / 无权限：账号级故障，core 统一按 403 上报。
+	{[]string{"disabled", "已被禁用", "forbidden", "无权限"}, core.FailureKindAccountFault, 0},
+	// 限流：短冷却。
+	{[]string{"too many", "too frequent", "频繁", "限流", "throttl"}, core.FailureKindSoftRate, http.StatusTooManyRequests},
+}
+
+// opsBusinessFailure 把 snap 信封里的业务码翻成分类错误。
+func opsBusinessFailure(code int64, message string) *core.Failure {
+	lower := strings.ToLower(message)
+	for _, entry := range opsBusinessMarkers {
+		if core.ContainsAny(lower, entry.markers) {
+			return &core.Failure{Kind: entry.kind, Status: entry.status, Code: strconv.FormatInt(code, 10), Msg: message}
+		}
+	}
+	return &core.Failure{Kind: core.FailureKindClient, Code: strconv.FormatInt(code, 10), Msg: message}
+}
+
+// benefitFailure 把福利接口的 error_code 翻成分类错误。
+//
+// 福利通道的码语义与 snap 信封不同，单独映射：
+//   - APIG.0602 / APIG.0301 → 凭证过期或签名失败（可续期，401）；
+//   - 4003 账号被禁用 → account_fault（core 按 403 上报，账号级）；
+//   - 4004 权益不存在 → not_found（换模型或换号都可能有用）；
+//   - 4006 今日名额用完 → soft_rate + RetryAfter 到次日 0 点（上游按天重置）。
+//
+// Msg 用 DescribeClaimError 翻好的可读文案，而不是上游裸码：签到横幅直接
+// 展示这一句。
+func benefitFailure(status int, code, raw string) *core.Failure {
+	message := DescribeClaimError(raw)
+	trimmed := strings.TrimSpace(code)
+	// 4xx 分支只拿得到原始正文：自己再解析一次错误码，别把 4006 这种
+	// 「按天重置」的信息丢掉（否则只能落到 Classify 的通用 client 分类）。
+	var envelope struct {
+		ErrorCode string `json:"error_code"`
+		ErrorMsg  string `json:"error_msg"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(raw), &envelope); errUnmarshal == nil {
+		trimmed = core.FirstNonEmpty(trimmed, strings.TrimSpace(envelope.ErrorCode))
+		if strings.TrimSpace(envelope.ErrorMsg) != "" {
+			message = DescribeClaimError(envelope.ErrorMsg)
+		}
+	}
+	switch {
+	case strings.Contains(trimmed, "APIG.0602"), strings.Contains(trimmed, "APIG.0301"),
+		strings.Contains(raw, "APIG.0602"), strings.Contains(raw, "APIG.0301"):
+		return &core.Failure{Kind: core.FailureKindCredential, Status: http.StatusUnauthorized, Code: trimmed, Msg: message}
+	case strings.Contains(trimmed, "4003"):
+		return &core.Failure{Kind: core.FailureKindAccountFault, Code: trimmed, Msg: message}
+	case strings.Contains(trimmed, "4004"):
+		return &core.Failure{Kind: core.FailureKindNotFound, Code: trimmed, Msg: message}
+	case strings.Contains(trimmed, "4006"):
+		return &core.Failure{
+			Kind: core.FailureKindSoftRate, Status: http.StatusTooManyRequests, Code: trimmed,
+			Msg: message, RetryAfter: untilNextCSTMidnight(),
+		}
+	}
+	if status >= http.StatusBadRequest {
+		failure := Classify(status, raw)
+		failure.Code = core.FirstNonEmpty(trimmed, failure.Code)
+		if strings.TrimSpace(failure.Msg) == "" {
+			failure.Msg = message
+		}
+		return failure
+	}
+	return &core.Failure{Kind: core.FailureKindClient, Code: trimmed, Msg: message}
+}
+
+// untilNextCSTMidnight 返回距下一个北京时间 0 点的等待时长（4006 按天重置）。
+func untilNextCSTMidnight() time.Duration {
+	zone := time.FixedZone("CST", 8*3600)
+	now := time.Now().In(zone)
+	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, zone).AddDate(0, 0, 1)
+	return next.Sub(now)
 }
 
 // text / boolValue / identifier / firstInt 是对上游 JSON 的宽容取值助手。
@@ -505,14 +618,20 @@ func fetchBenefitGatewayStatus(ctx context.Context, cred *Credential) (*BenefitG
 
 	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("codearts benefit gateway status failed: %w", errDo)
+		// 传输层失败归 transient：换号重试是安全的，也不能罚账号。
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "codearts benefit gateway status: " + errDo.Error()}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "read benefit gateway status: " + errRead.Error()}
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
+	// 200 包体里的业务错误信封同样要认，否则会被当成「通道已关闭」。
 	if failure, okFailure := ErrorFromPayload(body); okFailure {
 		return nil, failure
 	}
@@ -534,13 +653,18 @@ func claimBenefitToken(ctx context.Context, cred *Credential) (*BenefitClaim, er
 
 	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("codearts claim benefit failed: %w", errDo)
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "codearts claim benefit: " + errDo.Error()}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "read claim benefit response: " + errRead.Error()}
+	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("claim benefit response %d: %s", resp.StatusCode, DescribeClaimError(string(body)))
+		// 4006（名额用完）/ 4004（权益不存在）/ APIG.0602（STS 过期）都可能
+		// 以 4xx 到达，统一走福利码分类，别把它们压成一句无状态的文本。
+		return nil, benefitFailure(resp.StatusCode, "", string(body))
 	}
 	var envelope struct {
 		ErrorCode string        `json:"error_code"`
@@ -551,7 +675,7 @@ func claimBenefitToken(ctx context.Context, cred *Credential) (*BenefitClaim, er
 		return nil, fmt.Errorf("decode claim benefit response: %w", errUnmarshal)
 	}
 	if envelope.ErrorCode != "" && envelope.ErrorCode != "0000" {
-		return nil, fmt.Errorf("claim benefit %s: %s", envelope.ErrorCode, DescribeClaimError(envelope.ErrorMsg))
+		return nil, benefitFailure(0, envelope.ErrorCode, envelope.ErrorMsg)
 	}
 	if envelope.Result == nil {
 		return nil, fmt.Errorf("claim benefit response missing result: %s", DescribeClaimError(string(body)))
@@ -622,21 +746,32 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 	if monthlyLeft < 0 {
 		monthlyLeft = 0
 	}
+	// 顺序固定「剩余 → 总量 → 已用」，与其它渠道一致；控制台页头（插件 auth.Totals）取首个有容量的
+	// 族，把总量排前面会让同一排 chips 的阅读顺序和别家相反。
+	summary := []pluginapi.QuotaMetric{
+		{Key: "remaining", Label: "今日剩余", Value: float64(dailyLeft)},
+	}
+	// 上游没给每日上限（未开通 / 尚未下发）时不报 total：0 会被页面算成
+	// 0/0，渲染出 NaN%。缺这个键等于「没有总额」，页头显示「余额 / —」。
+	if balance.DailyTokenLimit > 0 {
+		summary = append(summary,
+			pluginapi.QuotaMetric{Key: "total", Label: "每日免费额度", Value: float64(balance.DailyTokenLimit)},
+			pluginapi.QuotaMetric{Key: "used", Label: "今日已用", Value: float64(balance.DailyTokensUsed)},
+		)
+	}
+	if balance.MonthlyTokenLimit > 0 {
+		summary = append(summary,
+			pluginapi.QuotaMetric{Key: "benefit_monthly_remaining", Label: "本月剩余", Value: float64(monthlyLeft)},
+			pluginapi.QuotaMetric{Key: "benefit_monthly_total", Label: "每月额度", Value: float64(balance.MonthlyTokenLimit)},
+		)
+	}
 	return &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
 			Plan:     "CodeArts 每日免费福利 Token",
 			TierName: core.FirstNonEmpty(balance.Channel, "benefit"),
 			TierID:   "benefit",
 		},
-		// 顺序固定「剩余 → 总量 → 已用」，与其它渠道一致；控制台页头（插件 auth.Totals）取首个有容量的
-		// 族，把总量排前面会让同一排 chips 的阅读顺序和别家相反。
-		Summary: []pluginapi.QuotaMetric{
-			{Key: "remaining", Label: "今日剩余", Value: float64(dailyLeft)},
-			{Key: "total", Label: "每日免费额度", Value: float64(balance.DailyTokenLimit)},
-			{Key: "used", Label: "今日已用", Value: float64(balance.DailyTokensUsed)},
-			{Key: "benefit_monthly_remaining", Label: "本月剩余", Value: float64(monthlyLeft)},
-			{Key: "benefit_monthly_total", Label: "每月额度", Value: float64(balance.MonthlyTokenLimit)},
-		},
+		Summary: summary,
 	}, nil
 }
 
@@ -679,10 +814,15 @@ func creditQuota(info *accountInfo) (*pluginapi.QuotaFetchResponse, bool) {
 		if amount > 0 {
 			fraction = core.ClampFraction(remain / amount)
 		}
+		description := fmt.Sprintf("剩余 %.2f / 总额 %.2f", remain, amount)
+		if amount <= 0 {
+			// 上游只给了余额没给总额：如实写「总额未知」，别让页面按 0 算比例。
+			description = fmt.Sprintf("剩余 %.2f（总额未知）", remain)
+		}
 		buckets = append(buckets, pluginapi.QuotaBucket{
 			Window:            label,
 			RemainingFraction: fraction,
-			Description:       fmt.Sprintf("剩余 %.2f / 总额 %.2f", remain, amount),
+			Description:       description,
 		})
 	}
 	if !sawMetric {
@@ -691,17 +831,24 @@ func creditQuota(info *accountInfo) (*pluginapi.QuotaFetchResponse, bool) {
 	if !sawTotal {
 		totalAmount, totalUsed, totalRemain = sumAmount, sumUsed, sumRemain
 	}
+	summary := []pluginapi.QuotaMetric{
+		{Key: "remaining", Label: "剩余积分", Value: totalRemain},
+	}
+	// 上游报了总额（>0）才给 total 键：total=0 会被页面算成 0/0 → NaN%。
+	// 缺这个键的语义就是「没有总额」，页头显示「余额 / —」。
+	if totalAmount > 0 {
+		summary = append(summary,
+			pluginapi.QuotaMetric{Key: "total", Label: "积分总额", Value: totalAmount},
+			pluginapi.QuotaMetric{Key: "used", Label: "已用积分", Value: totalUsed},
+		)
+	}
 	response := &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
 			Plan:     "CodeArts 积分",
 			TierName: core.FirstNonEmpty(info.Package.PackageNameCN, info.Package.PackageNameEN, "积分计费"),
 			TierID:   core.FirstNonEmpty(info.Package.SpecCode, "credit"),
 		},
-		Summary: []pluginapi.QuotaMetric{
-			{Key: "remaining", Label: "剩余积分", Value: totalRemain},
-			{Key: "total", Label: "积分总额", Value: totalAmount},
-			{Key: "used", Label: "已用积分", Value: totalUsed},
-		},
+		Summary: summary,
 	}
 	if len(buckets) > 0 {
 		response.Groups = []pluginapi.QuotaGroup{{
@@ -713,6 +860,9 @@ func creditQuota(info *accountInfo) (*pluginapi.QuotaFetchResponse, bool) {
 }
 
 // noCreditQuota 是积分账户但上游未返回指标时的额度结果。
+//
+// 只报 remaining=0，不给 total：上游没报总额，硬填 0 会让页面算 0/0（NaN%）。
+// Label 里保留原因，用户才知道 0 是「没开通」而不是「查询坏了」。
 func noCreditQuota(info *accountInfo) *pluginapi.QuotaFetchResponse {
 	tierName := "积分计费"
 	specCode := "credit"
@@ -722,13 +872,8 @@ func noCreditQuota(info *accountInfo) *pluginapi.QuotaFetchResponse {
 	}
 	return &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{Plan: "CodeArts 积分", TierName: tierName, TierID: specCode},
-		// 上游没返回指标时仍要给出 total / remaining / used 三个键：控制台页头（插件 auth.Totals）
-		// 靠它们折算总额，键缺失会让整张卡变成「暂无额度数据」。Label 里保留
-		// 原因说明，用户才知道 0 是「没开通」而不是「查询坏了」。
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "remaining", Label: "剩余积分", Value: 0},
-			{Key: "total", Label: "积分总额（上游未返回积分指标）", Value: 0},
-			{Key: "used", Label: "已用积分", Value: 0},
+			{Key: "remaining", Label: "剩余积分（上游未返回积分指标）", Value: 0},
 		},
 	}
 }
@@ -741,7 +886,6 @@ func noBenefitQuota() *pluginapi.QuotaFetchResponse {
 			TierName: "未开通",
 			TierID:   "benefit",
 		},
-		// 同上：total 键必须在，否则控制台折算不出总额；标签说明原因。
 		Summary: []pluginapi.QuotaMetric{
 			{Key: "total", Label: "每日免费额度（上游未开通福利权益，无可查额度）", Value: 0},
 		},
@@ -771,11 +915,14 @@ func fetchBenefitBalance(ctx context.Context, cred *Credential) (*benefitBalance
 	client := hostbridge.Client(ctx, 20*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("codearts benefit balance failed: %w", errDo)
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "codearts benefit balance: " + errDo.Error()}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "read benefit balance response: " + errRead.Error()}
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
@@ -799,7 +946,7 @@ func fetchBenefitBalance(ctx context.Context, cred *Credential) (*benefitBalance
 		return nil, nil
 	}
 	if envelope.ErrorCode != "" && envelope.ErrorCode != "0000" {
-		return nil, fmt.Errorf("benefit balance %s: %s", envelope.ErrorCode, DescribeClaimError(envelope.ErrorMsg))
+		return nil, benefitFailure(0, envelope.ErrorCode, envelope.ErrorMsg)
 	}
 	return &benefitBalance{
 		Channel:           envelope.Result.Channel,
@@ -808,4 +955,164 @@ func fetchBenefitBalance(ctx context.Context, cred *Credential) (*benefitBalance
 		MonthlyTokenLimit: envelope.Result.MonthlyTokenLimit,
 		MonthlyTokensUsed: envelope.Result.MonthlyTokensUsed,
 	}, nil
+}
+
+// ---- 一键任务 ----
+//
+// 上游能自动完成的活动只有两类：每日登录（签到，core 统一实现）与活动列表
+// 里其它已开放条目。后者官方 IDE 有领取按钮，代理此前从不触碰，等于白丢，
+// 所以按下面的表逐行补上。
+
+// AutoTaskCodeOpsBenefit 是一键任务里「活动福利」那一行的任务码。
+const AutoTaskCodeOpsBenefit = "(活动福利)"
+
+// autoTask 是一键任务表的一行。
+type autoTask struct {
+	code  string
+	label string
+	// skip 返回非空原因时本行不执行（→ skipped，原因即此）。
+	skip func(*autoRun) string
+	// exec 执行本行；outcome.message 为空表示无事可做。
+	exec func(context.Context, *autoRun) (autoOutcome, error)
+}
+
+// autoOutcome 是一行任务的产出。
+type autoOutcome struct {
+	message string
+	// reason 是「无事可做」时的可读原因（message 为空时使用）。
+	reason string
+	credit int64
+	energy int64
+}
+
+// autoRun 是一轮一键任务的共享上下文。
+type autoRun struct {
+	cred *Credential
+}
+
+// autoTasks 是一键任务表（顺序即依赖序：签到之后才领其它活动）。
+var autoTasks = []autoTask{
+	{
+		code:  AutoTaskCodeOpsBenefit,
+		label: "活动福利",
+		skip: func(run *autoRun) string {
+			if run.cred == nil || strings.TrimSpace(run.cred.AccessKeyID) == "" {
+				return "凭证缺少 AK，无法查询活动列表"
+			}
+			return ""
+		},
+		exec: claimOpsActivities,
+	},
+}
+
+// runAutoTasks 按表执行，把每一行折成 core 的三态结果。
+func runAutoTasks(ctx context.Context, tasks []autoTask, run *autoRun) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, len(tasks))
+	for _, task := range tasks {
+		results = append(results, task.run(ctx, run))
+	}
+	return results
+}
+
+// run 执行一行任务：前置不成立即 skipped，执行失败即 error，无产出即 skipped。
+func (t autoTask) run(ctx context.Context, run *autoRun) core.AutoTaskResult {
+	result := core.AutoTaskResult{Code: t.code}
+	if t.skip != nil {
+		if reason := t.skip(run); reason != "" {
+			result.Status = core.AutoStatusSkipped
+			result.Message = reason
+			return result
+		}
+	}
+	outcome, errExec := t.exec(ctx, run)
+	result.Credit, result.Energy = outcome.credit, outcome.energy
+	switch {
+	case errExec != nil:
+		result.Status = core.AutoStatusError
+		result.Message = t.label + "：" + describeFailure(errExec)
+	case strings.TrimSpace(outcome.message) == "":
+		result.Status = core.AutoStatusSkipped
+		result.Message = core.FirstNonEmpty(outcome.reason, "当前无需动作")
+	default:
+		result.Status = core.AutoStatusDone
+		result.Message = outcome.message
+	}
+	return result
+}
+
+// autoTaskFor 按任务码查表。
+func autoTaskFor(code string) (autoTask, bool) {
+	trimmed := strings.TrimSpace(code)
+	for _, task := range autoTasks {
+		if task.code == trimmed {
+			return task, true
+		}
+	}
+	return autoTask{}, false
+}
+
+// isAlreadyClaimed 判断领取失败是否只是「已经领过」。
+//
+// 上游对这种幂等命中不回统一的业务码，只能按文案识别；识别不出来时宁可
+// 记成失败（多一条可读原因），也不吞掉真实错误。
+func isAlreadyClaimed(err error) bool {
+	lower := strings.ToLower(err.Error())
+	return core.ContainsAny(lower, []string{
+		"已领取", "已领过", "重复领取", "already claimed", "already_claimed", "already received", "already used",
+	})
+}
+
+// claimOpsActivities 领取活动列表里除「每日登录」之外的全部可领活动。
+//
+// 每日登录由签到行负责，这里跳过它：重复领只会拿到「已领取」，白花一次请求。
+// 部分成功也按 done 上报（确实领到了东西），失败明细写进同一行，不吞证据。
+func claimOpsActivities(ctx context.Context, run *autoRun) (autoOutcome, error) {
+	activities, errFetch := fetchOpsActivities(ctx, run.cred)
+	if errFetch != nil {
+		return autoOutcome{}, errFetch
+	}
+	claimed := make([]string, 0, len(activities))
+	failures := make([]string, 0, 2)
+	var total int64
+	for _, activity := range activities {
+		if activity.Type == OpsDailyLoginType || !activity.Claimable {
+			continue
+		}
+		if claimedStatuses[strings.ToUpper(activity.Status)] {
+			continue
+		}
+		claim, errClaim := claimOps(ctx, run.cred, activity.CampaignID)
+		if errClaim != nil {
+			// 「已经领过」不是失败：同一活动可能已由签到或上一轮领走，
+			// 把它记成错误会让用户以为一键任务坏了。
+			if isAlreadyClaimed(errClaim) {
+				continue
+			}
+			failures = append(failures, activity.CampaignID+"："+describeFailure(errClaim))
+			continue
+		}
+		if claim.benefitID != "" {
+			// 与签到一致：需要二次确认的通道补 confirm，失败不推翻已领取的事实。
+			_, _ = signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsConfirm, run.cred,
+				[]byte(`{"campaignId":"`+jsonEscape(activity.CampaignID)+`"}`))
+		}
+		amount := claim.credit
+		if amount == 0 {
+			amount = activity.Amount
+		}
+		total += amount
+		claimed = append(claimed, activity.CampaignID)
+	}
+	switch {
+	case len(claimed) > 0:
+		message := "领取 " + strconv.Itoa(len(claimed)) + " 个活动，共 +" + strconv.FormatInt(total, 10) + " 积分"
+		if len(failures) > 0 {
+			message += "；失败 " + strconv.Itoa(len(failures)) + " 个：" + strings.Join(failures, " / ")
+		}
+		return autoOutcome{message: message, credit: total}, nil
+	case len(failures) > 0:
+		return autoOutcome{}, errors.New(strings.Join(failures, " / "))
+	default:
+		return autoOutcome{reason: "没有其它可领活动"}, nil
+	}
 }

@@ -155,10 +155,10 @@ func (a *App) runStreamExecution(streamCtx context.Context, cancelStream context
 	errForward := prepared.vendor.ExecuteStream(ctx, prepared.credential, prepared.executeRequest(), sink)
 	// 下游主动断开会取消上下文，那不是错误，不该发错误帧给客户端。
 	if errForward != nil && streamCtx.Err() == nil {
-		closeStream(callbackID, streamID, streamFailureMessage(errForward))
+		closeStream(callbackID, streamID, errForward)
 		return
 	}
-	closeStream(callbackID, streamID, "")
+	closeStream(callbackID, streamID, nil)
 }
 
 // hostStreamSink 把宿主的流式投递能力包装成 core.StreamSink。
@@ -355,17 +355,57 @@ func emitStreamChunk(callbackID, streamID string, payload []byte) error {
 	return errCall
 }
 
-// closeStream 关闭宿主流；failure 非空时由宿主转为错误帧。
-func closeStream(callbackID, streamID, failure string) {
+// closeStream 关闭宿主流；failure 非 nil 时由宿主转为错误帧。
+//
+// 错误帧同时带文本与结构化详情：只发文本时宿主按「无状态码的插件错误」处理，
+// 客户端一律收到 500，凭证也不进冷却——被封的账号会因此每 60-90 秒被重新选中、
+// 白打一次上游。error_detail 让状态码、可重试标记与 Retry-After 一起过桥，
+// 宿主才能按自己的冷却规则处置（文本字段保留，旧宿主行为不变）。
+func closeStream(callbackID, streamID string, failure error) {
 	if strings.TrimSpace(streamID) == "" {
 		return
 	}
 	payload := map[string]any{"stream_id": streamID}
-	if failure != "" {
-		payload["error"] = failure
+	if failure != nil {
+		message := streamFailureMessage(failure)
+		if message != "" {
+			payload["error"] = message
+		}
+		if detail := streamErrorDetail(failure, message); detail != nil {
+			payload["error_detail"] = detail
+		}
 	}
 	if _, errCall := hostbridge.Call(callbackID, pluginabi.MethodHostStreamClose, payload); errCall != nil {
 		logger.Debug("stream close failed: %v", errCall)
+	}
+}
+
+// streamErrorDetail 把分类后的错误翻成宿主 ABI 的结构化错误对象。
+//
+// 分类（core.ToPluginError）已经把供应商错误归到 HTTP 状态码与可重试语义上；
+// 拿不到分类结果时返回 nil，由宿主按旧口径处理，不会比修复前更差。
+func streamErrorDetail(errClose error, message string) *pluginabi.Error {
+	pluginErr, okPlugin := core.ToPluginError(errClose).(*core.PluginError)
+	if !okPlugin || pluginErr == nil {
+		return nil
+	}
+	if strings.TrimSpace(message) == "" {
+		message = pluginErr.Message
+	}
+	// 等待秒数取两处口径的较大者：分类结果可能已经从宿主桥的错误文本里还原出
+	// Retry-After，而原始 error 上取不到。
+	seconds := pluginErr.RetryAfterSeconds
+	if wait := core.RetryAfterOf(errClose); wait > 0 {
+		if rounded := int((wait + time.Second - 1) / time.Second); rounded > seconds {
+			seconds = rounded
+		}
+	}
+	return &pluginabi.Error{
+		Code:              pluginErr.Code,
+		Message:           message,
+		Retryable:         pluginErr.Retryable,
+		HTTPStatus:        pluginErr.HTTPStatus,
+		RetryAfterSeconds: seconds,
 	}
 }
 

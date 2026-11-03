@@ -124,6 +124,14 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 //
 // 签到接口的失败码在 base_resp.status_code（不是 HTTP 状态码），例如缺少
 // timezone_id 时返回 HTTP 200 + status_code != 0。忽略它会把失败报成成功。
+//
+// 分类走本包的 Classify（status=0：错误发生在「传输成功」的响应里）：
+//   - 会话失效文案 → 401 凭证错误，宿主才会禁用这个号；
+//   - 余额/限流文案 → 402 / 429，宿主据此冷却；
+//   - 其余业务码 → client（参数或账号状态问题，不是网络故障）。
+//
+// 缺省归 client 而不是 transient：502 会让宿主无限换号重试同一个必然失败
+// 的请求，而 timezone_id 这类错误换个号也不会好。
 func signinBusinessError(payload map[string]any) error {
 	baseResp, okBase := payload["base_resp"].(map[string]any)
 	if !okBase {
@@ -134,8 +142,26 @@ func signinBusinessError(payload map[string]any) error {
 		return nil
 	}
 	message := core.FirstNonEmpty(core.GetString(baseResp, "status_msg"), fmt.Sprintf("上游业务错误 %d", code))
-	return core.NewPluginError("upstream_business", message, http.StatusBadGateway)
+	failure := Classify(0, message)
+	if failure.Kind == core.FailureKindTransient {
+		failure.Kind = core.FailureKindClient
+	}
+	failure.Code = fmt.Sprintf("status_%d", code)
+	// 用可读包装返回：签到历史直接展示 err.Error()，带上 "upstream client [0]:"
+	// 这类内部分类前缀会让人看不懂；Unwrap 保留分类错误，宿主仍能按 Kind
+	// 决定冷却/禁用（errors.As 会穿透 Unwrap）。
+	return &businessError{failure: failure}
 }
+
+// businessError 是「HTTP 200 包体里的业务失败」：对外只暴露上游原文，
+// 对内保留分类错误。
+type businessError struct {
+	failure *core.Failure
+}
+
+func (e *businessError) Error() string { return e.failure.Msg }
+
+func (e *businessError) Unwrap() error { return e.failure }
 
 // FetchQuota 查询 MiniMax 账号的额度余额。
 func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (*pluginapi.QuotaFetchResponse, error) {

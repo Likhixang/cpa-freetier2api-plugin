@@ -398,6 +398,9 @@ type sseDeltaChunk struct {
 // CollapseSSEToJSON 将上游 SSE 流消费并组装成一个完整的 OpenAI 格式 chat.completion JSON 响应。
 func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames) ([]byte, error) {
 	scanner := bufio.NewScanner(r)
+	// 单帧上限：默认 64KB 会被长工具参数/长思考块撑爆，撑爆后 Scan 返回 false
+	// 且 Err() 是 ErrTooLong，整段回答会被静默截断。
+	scanner.Buffer(make([]byte, 0, 64*1024), hostbridge.SSEScannerBuffer)
 	resp := chatCompletionResponse{
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
@@ -425,6 +428,12 @@ func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
 			break
+		}
+		// 上游会用 200 + {"error":{...}} 的帧表达失败（FreeTierError、限流、
+		// 上游过载）。不认这一帧，失败就被折叠成一条 content 为空的 200 响应，
+		// 客户端只看到「模型什么都没说」。
+		if failure := frameFailure(data); failure != nil {
+			return nil, failure
 		}
 		var chunk sseDeltaChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
@@ -460,6 +469,11 @@ func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames
 		}
 	}
 
+	// 扫描中断（帧超长 / 读错误）必须上抛：静默返回半段回答比报错更糟。
+	if errScan := scanner.Err(); errScan != nil {
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "read sse stream: " + errScan.Error()}
+	}
+
 	contentStr := contentBuilder.String()
 	resp.Choices[0].Message.Content = contentStr
 	resp.Choices[0].Message.ReasoningContent = reasoningBuilder.String()
@@ -488,6 +502,25 @@ func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames
 	}
 
 	return json.Marshal(resp)
+}
+
+// frameFailure 识别 SSE 数据帧里的错误信封。
+//
+// 只在确实带 error 字段时返回失败：正常帧没有这个键，误判会把好帧当错误。
+func frameFailure(data string) error {
+	var frame struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal([]byte(data), &frame); errUnmarshal != nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(string(frame.Error))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	// status 传 0：错误发生在「传输成功」的帧里，分类由正文决定
+	// （FreeTierError 归 client，不罚账号）。
+	return Classify(0, data)
 }
 
 func mergeToolCalls(accumulated []any, incoming []any) []any {

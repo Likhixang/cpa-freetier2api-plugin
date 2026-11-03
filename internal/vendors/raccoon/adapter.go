@@ -293,52 +293,92 @@ func (v *adapter) CheckinUnsupportedReason(_ *core.Credential) string {
 
 // ---- 登录与续期 ----
 
-// LoginStart 发起一次网页授权登录：生成一次性 state 并登记会话，
-// 返回官方授权页 URL（用户在页面登录后浏览器跳 office-raccoon:// 回调，
-// 把整条链接粘回控制台由 SubmitCallback 完成换票）。
+// LoginStart 发起一次网页授权登录。
+//
+// 生成一次性 state、登记会话，并在本机起一次性回调监听：授权页按
+// desktop_callback=loopback 回跳 127.0.0.1，插件收到 code 当场完成登录。
+// 监听起不来（端口不可用）不影响登录，用户仍可把回调链接粘回来。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
 	state := core.RandomHex(32)
 	sessionID := VendorID + "_" + state
 	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{State: state})
+	redirect, listening := startCallbackCatcher(sessionID, state, func(callbackCtx context.Context, code string) (string, error) {
+		// 会话可能已被清理（超时、用户重开一次登录）：先确认还在，再去换票。
+		// 否则换票成功也无人认领，用户只会在页面上看到一句「成功」。
+		session, pollState := v.Env.Logins.Poll(sessionID)
+		if pollState == core.PollMissing {
+			return "", fmt.Errorf("登录会话已结束，请重新发起登录")
+		}
+		pending, okPending := session.Data.(*PendingLogin)
+		if !okPending {
+			return "", fmt.Errorf("登录会话数据已损坏，请重新发起登录")
+		}
+		result, errComplete := v.completeLogin(callbackCtx, code)
+		if errComplete != nil {
+			return "", errComplete
+		}
+		// 结果交给会话，由控制台的下一次 LoginPoll 取走落盘。
+		pending.StoreResult(result)
+		return "小浣熊登录成功", nil
+	})
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
-		URL:       AuthorizeURLWith(v.resolveOrigin(), loginAppName, state),
+		URL:       AuthorizeURLWith(v.resolveOrigin(), loginAppName, state, redirect),
 		State:     sessionID,
 		ExpiresAt: time.Now().Add(qrLoginTTL),
-		Metadata:  map[string]any{core.VendorKey: VendorID},
+		Metadata: map[string]any{
+			core.VendorKey:   VendorID,
+			"callback_hint":  redirect,
+			"callback_ready": listening,
+		},
 	}, nil
 }
 
 // LoginPoll 轮询一次登录状态。
 //
-// 授权页模式没有可轮询的上游端点：凭证只在用户把回调链接粘回来时
-// 经 SubmitCallback 到达。这里只回报进度；state 失配（用户粘贴）由
-// SubmitCallback 拒绝。
+// 授权页模式没有可轮询的上游端点：凭证要么由本机回调监听自动换回，要么由
+// 用户粘贴链接经 SubmitCallback 到达。自动换回的结果存在会话里，这里取到就
+// 按 success 返回（宿主据此落盘），否则回报进度并把两条路径讲清楚。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	_, exists, _ := CheckLoginSession(v.Env.Logins, state)
+	sessionID := strings.TrimSpace(state)
+	pending, exists, _ := CheckLoginSession(v.Env.Logins, sessionID)
 	if !exists {
+		// 会话已结束（完成/过期/被清理）：顺手收掉监听，别把端口占到 TTL。
+		stopCallbackCatcher(sessionID)
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
+	if result := pending.TakeResult(); result != nil {
+		// 回调已经换到凭证：交给宿主落盘，会话与监听都到此为止。
+		v.Env.Logins.Delete(sessionID)
+		stopCallbackCatcher(sessionID)
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusSuccess,
+			Message: result.Message,
+			Auth:    result.Auth,
+		}, nil
+	}
+	redirect, listening := callbackListening(sessionID)
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusPending,
-		Message: pendingMessage,
+		Message: pendingMessage(redirect, listening),
 	}, nil
 }
 
 // LocalCallbackHint 返回控制台要展示的回调形态（授权码换票兜底用）。
 func (v *adapter) LocalCallbackHint() string {
-	return "office-raccoon://auth/callback?code=…&state=…"
+	return CallbackURL() + "?code=…&state=…"
 }
 
-// SubmitCallback 解析用户粘贴的回调链接（或裸授权码）并换票完成登录。
+// SubmitCallback 解析用户粘贴的回调链接（深链或 loopback）并换票完成登录。
 //
-// 这是扫码登录的兜底：用户也可以在官方页面走 office-raccoon:// 回调，
-// 把地址栏整条链接粘回来换票。
+// 这是异机场景的唯一出路：浏览器停在 127.0.0.1 的回调上，那条 HTTP 请求
+// 永远打不到插件，但地址栏里的整条链接是完整的。
 func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
-	session, pollState := v.Env.Logins.Poll(strings.TrimSpace(state))
+	sessionID := strings.TrimSpace(state)
+	session, pollState := v.Env.Logins.Poll(sessionID)
 	if pollState == core.PollMissing {
 		return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 	}
@@ -349,7 +389,7 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	code, callbackState, okCode := ParseCallbackCode(rawURL)
 	if !okCode {
 		return nil, core.NewPluginError("callback_parse_failed",
-			"回调链接解析失败，请确认粘贴的是完整回调链接（office-raccoon://auth/callback?code=…）",
+			"回调链接解析失败，请确认粘贴的是完整回调链接（"+CallbackURL()+"?code=…&state=… 或 office-raccoon://auth/callback?code=…&state=…）",
 			http.StatusBadRequest)
 	}
 	if !CheckCallbackState(pending, callbackState) {
@@ -357,6 +397,28 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 			"登录回调 state 校验失败，请重新发起登录",
 			http.StatusBadRequest)
 	}
+	// 本机监听可能已经先一步换到凭证：直接把它交给控制台，别拿同一个
+	// 一次性 code 再换一次（那只会得到「授权码已失效」）。
+	if result := pending.TakeResult(); result != nil {
+		v.Env.Logins.Delete(sessionID)
+		stopCallbackCatcher(sessionID)
+		return result, nil
+	}
+	result, errComplete := v.completeLogin(ctx, code)
+	if errComplete != nil {
+		return nil, errComplete
+	}
+	// 手工粘贴完成后会话与监听都没用了，立刻释放端口。
+	v.Env.Logins.Delete(sessionID)
+	stopCallbackCatcher(sessionID)
+	return result, nil
+}
+
+// completeLogin 用授权码换票并产出凭证。
+//
+// loopback 回调与手工粘贴共用这一条路：两条入口的差别只在 code 怎么到手，
+// 换票、取账号信息、落盘格式必须完全一致。
+func (v *adapter) completeLogin(ctx context.Context, code string) (*core.CallbackSubmitResult, error) {
 	access, refresh, expiresAt, uid, errExchange := ExchangeAuthorizationCode(ctx, v.resolveAuthBase(), code)
 	if errExchange != nil {
 		return nil, core.ToPluginError(errExchange)
@@ -379,7 +441,8 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	if errStorage != nil {
 		return nil, core.NewPluginError("login_failed", "构建凭证失败："+errStorage.Error(), http.StatusInternalServerError)
 	}
-	v.Env.Logins.Delete(strings.TrimSpace(state))
+	// 会话的删除交给调用方：回调线程要把结果留在会话里等轮询取走，
+	// 手工粘贴则当场删。这里删掉会让自动完成的那次登录无人认领。
 	return &core.CallbackSubmitResult{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "小浣熊登录成功",
@@ -390,6 +453,52 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 			StorageJSON: storageJSON,
 		},
 	}, nil
+}
+
+// ---- 一键任务 ----
+
+// AutoTaskCodeLoginGrant 是一键任务里「登录奖励」那一行的任务码。
+const AutoTaskCodeLoginGrant = "(登录奖励)"
+
+// RunAllTasks 执行一键任务。
+//
+// 小浣熊没有每日签到，客户端唯一能领的是官方桌面端登录弹窗的一次性积分，
+// 且每号只能领一次。放进一键任务时按幂等处理：已领过的记 skipped，
+// 不产生失败历史。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	result, errCheckin := v.Checkin(ctx, cred)
+	if errCheckin != nil {
+		return []core.AutoTaskResult{{
+			Code:    AutoTaskCodeLoginGrant,
+			Status:  core.AutoStatusError,
+			Message: core.ToPluginError(errCheckin).Error(),
+		}}
+	}
+	if result == nil {
+		return nil
+	}
+	status := core.AutoStatusDone
+	if result.Already {
+		status = core.AutoStatusSkipped
+	}
+	return []core.AutoTaskResult{{
+		Code:    AutoTaskCodeLoginGrant,
+		Status:  status,
+		Message: result.Message,
+		Credit:  result.Credit,
+	}}
+}
+
+// RunTask 执行单条任务。小浣熊只有一条一次性登录奖励。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != AutoTaskCodeLoginGrant {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	rows := v.RunAllTasks(ctx, cred)
+	if len(rows) == 0 {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "没有可执行的动作"}, nil
+	}
+	return core.TaskRunResult{Status: rows[0].Status, Message: rows[0].Message, Credit: rows[0].Credit}, nil
 }
 
 // MergeCredentialJSON 实现存储合并（见 credential.go）。
@@ -427,4 +536,5 @@ var (
 	_ core.QuotaProvider        = (*adapter)(nil)
 	_ core.Refresher            = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

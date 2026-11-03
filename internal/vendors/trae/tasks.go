@@ -67,7 +67,13 @@ func Checkin(ctx context.Context, cred *Credential, cfg Config) (*CheckinResult,
 			return nil, fmt.Errorf("签到活动未开启")
 		}
 		if status.CheckedIn {
-			return &CheckinResult{Already: true, Credit: status.Credits, Message: "今日已完成签到"}, nil
+			// Credit 的语义是「本次所得」：Already 分支本次一分没进，写累计值会让
+			// 历史里的「本次获得」直接跳到累计数（其他渠道都是本次口径）。
+			message := "今日已完成签到"
+			if status.Credits > 0 {
+				message = fmt.Sprintf("今日已完成签到（累计 %d 积分）", status.Credits)
+			}
+			return &CheckinResult{Already: true, Credit: 0, Message: message}, nil
 		}
 	}
 
@@ -241,7 +247,11 @@ func postJSON(ctx context.Context, url string, headers map[string]string, payloa
 		return 0, nil, fmt.Errorf("trae request failed: %w", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return 0, nil, fmt.Errorf("trae read response: %w", errRead)
+	}
 	return resp.StatusCode, body, nil
 }
 
@@ -488,9 +498,49 @@ const (
 	EpUGCompetitionClaim = "/trae/api/v2/ug/competition/claim_package"
 	// EpUGWorkLotteryDraw 抽奖（作品活动）。
 	EpUGWorkLotteryDraw = "/trae/api/v2/ug/work_lottery/draw"
+	// 以下三个端点必须带活动 ID / 作品 ID，插件取不到，因此只登记在动作表里
+	// 说明「为什么领不到」，不进批量入口。
+	EpUGCobrandClaim     = "/trae/api/v2/ug/cobrand/claim"
+	EpUGWorkFissionShare = "/trae/api/v2/ug/work_fission/share_link"
+	EpUGCodeFissionShare = "/trae/api/v2/ug/code_fission/share_link"
 )
 
-// UGAction 描述一个福利端点。
+// ugEndpointRunner 是动作表里的调用函数。
+//
+// 第二个返回值只在「这一轮不该继续」时非空（凭证失效、整轮取消）；单个端点
+// 的业务失败只体现在 UGResult 上，不影响后面的端点。
+type ugEndpointRunner func(ctx context.Context, cfg Config, headers map[string]string, endpoint UGEndpoint) (UGResult, error)
+
+// UGEndpoint 描述一个活动动作。
+//
+// 全部已知端点都在这张表里：key 稳定（日志/前端过滤用）、label 给人看、
+// path 是相对签到主机的路径、needs_input 标记上游是否要求额外入参、
+// run 决定怎么调用它。新增端点只加一行，不要另起 switch。
+type UGEndpoint struct {
+	Key   string
+	Label string
+	Path  string
+	// NeedsInput 表示上游要求 activity_id / 作品 ID。插件没有取这些 ID 的
+	// 渠道，调用只会得到 4001 / 9080「param is invalid」。
+	NeedsInput bool
+	// Run 是该动作的调用方式。
+	Run ugEndpointRunner
+}
+
+// ugEndpointTable 是活动动作的唯一清单。
+//
+// 只收能说清行为的端点：能直接 POST 的（竞赛 / 抽奖）进批量入口；需要入参的
+// （联合活动 / 两个 share_link）保留登记但标记 needs_input，调用时直接返回
+// 「缺入参」而不是白打一次注定失败的请求。
+var ugEndpointTable = []UGEndpoint{
+	{Key: "competition_claim", Label: "竞赛奖励", Path: EpUGCompetitionClaim, Run: runUGPost},
+	{Key: "work_lottery_draw", Label: "作品抽奖", Path: EpUGWorkLotteryDraw, Run: runUGPost},
+	{Key: "cobrand_claim", Label: "联合活动", Path: EpUGCobrandClaim, NeedsInput: true, Run: runUGNeedsInput},
+	{Key: "work_fission_share", Label: "作品分享裂变", Path: EpUGWorkFissionShare, NeedsInput: true, Run: runUGNeedsInput},
+	{Key: "code_fission_share", Label: "邀请码分享", Path: EpUGCodeFissionShare, NeedsInput: true, Run: runUGNeedsInput},
+}
+
+// UGAction 描述一个可批量尝试的福利端点。
 type UGAction struct {
 	// Key 是稳定标识（落日志/前端过滤用），不随文案变。
 	Key string
@@ -500,22 +550,53 @@ type UGAction struct {
 	Path string
 }
 
+// ugBatchEndpoints 返回不需要任何入参、可以直接 POST 的动作。
+func ugBatchEndpoints() []UGEndpoint {
+	out := make([]UGEndpoint, 0, len(ugEndpointTable))
+	for _, endpoint := range ugEndpointTable {
+		if endpoint.NeedsInput || endpoint.Run == nil {
+			continue
+		}
+		out = append(out, endpoint)
+	}
+	return out
+}
+
 // UGActions 返回签到之外可批量尝试的活动入口。
 //
-// 只收「不带任何入参就能 POST」的端点。另有三个端点必须带活动 ID 或作品 ID
-// （实测上游回 4001 / 9080「param is invalid」），而插件既没有取活动列表的
-// 渠道、也拿不到用户的作品 ID，因此不进清单：
-//   - POST /trae/api/v2/ug/cobrand/claim（需 activity_id）
-//   - POST /trae/api/v2/ug/work_fission/share_link（需作品 ID）
-//   - POST /trae/api/v2/ug/code_fission/share_link（需作品 ID）
-//
-// 放进批量入口只会每轮白打 3 次请求（各自最多 30s），再把注定失败的结果
-// 包装成「暂不可领」，既拖慢整轮又掩盖真实原因。等能取到 ID 再接。
+// 兑换码需要用户输入，而手动触发路由只传任务族名、没有请求体通道，故不提供
+// 入口——留着实现却调不到，只会是死代码。
 func UGActions() []UGAction {
-	return []UGAction{
-		{Key: "competition_claim", Label: "竞赛奖励", Path: EpUGCompetitionClaim},
-		{Key: "work_lottery_draw", Label: "作品抽奖", Path: EpUGWorkLotteryDraw},
+	batchable := ugBatchEndpoints()
+	out := make([]UGAction, 0, len(batchable))
+	for _, endpoint := range batchable {
+		out = append(out, UGAction{Key: endpoint.Key, Label: endpoint.Label, Path: endpoint.Path})
 	}
+	return out
+}
+
+// ugEndpointByKey 按 key 取动作（一键任务按点名执行单条时用）。
+func ugEndpointByKey(key string) (UGEndpoint, bool) {
+	trimmed := strings.TrimSpace(key)
+	for _, endpoint := range ugEndpointTable {
+		if endpoint.Key == trimmed {
+			return endpoint, true
+		}
+	}
+	return UGEndpoint{}, false
+}
+
+// runUGNeedsInput 处理需要入参的动作：不发请求，直接说明缺什么。
+//
+// 上游对这类端点回 4001 / 9080，重试与换账号都不会变，报成失败只会掩盖
+// 「插件本来就取不到这个 ID」这一事实。
+func runUGNeedsInput(_ context.Context, _ Config, _ map[string]string, endpoint UGEndpoint) (UGResult, error) {
+	return UGResult{
+		Key:     endpoint.Key,
+		Label:   endpoint.Label,
+		Status:  UGUnavailable,
+		Message: "上游要求活动 ID 或作品 ID，插件取不到，无法代领",
+	}, nil
 }
 
 // UGStatus 是一次领取的归类。
@@ -628,12 +709,12 @@ func ClaimUG(ctx context.Context, cred *Credential, cfg Config) ([]UGResult, err
 	ctx, cancel := context.WithTimeout(ctx, ugRoundTimeout())
 	defer cancel()
 
-	results := make([]UGResult, 0, len(UGActions())+8)
-	for _, action := range UGActions() {
+	results := make([]UGResult, 0, len(ugBatchEndpoints())+8)
+	for _, endpoint := range ugBatchEndpoints() {
 		if errCtx := ctx.Err(); errCtx != nil {
 			return results, errCtx
 		}
-		result, errStop := claimUGOne(ctx, cfg, headers, action)
+		result, errStop := endpoint.Run(ctx, cfg, headers, endpoint)
 		results = append(results, result)
 		if errStop != nil {
 			// 凭证失效：后面的端点只会得到同一个 401，停在这里并如实上报。
@@ -683,13 +764,13 @@ func ugRoundTimeout() time.Duration {
 	return 2*perRequestTimeout + 3*ugDynamicTimeout + ugFissionReserve() + ugRoundSlack
 }
 
-// claimUGOne 打一个端点并归类结果。
+// runUGPost 打一个「无需入参」的端点并归类结果。
 //
 // 第二个返回值只在「这一轮不该继续」时非空（凭证失效），其余失败只体现在
 // UGResult 上：单个活动不可领不影响后面的端点。
-func claimUGOne(ctx context.Context, cfg Config, headers map[string]string, action UGAction) (UGResult, error) {
-	result := UGResult{Key: action.Key, Label: action.Label}
-	status, body, errDo := postJSON(ctx, cfg.CheckinHost+action.Path, headers, nil)
+func runUGPost(ctx context.Context, cfg Config, headers map[string]string, endpoint UGEndpoint) (UGResult, error) {
+	result := UGResult{Key: endpoint.Key, Label: endpoint.Label}
+	status, body, errDo := postJSON(ctx, cfg.CheckinHost+endpoint.Path, headers, nil)
 	if errDo != nil {
 		result.Status = UGFailed
 		result.Message = errDo.Error()
@@ -1203,7 +1284,7 @@ func claimUGActivity(ctx context.Context, cfg Config, headers map[string]string,
 		return result, nil
 	}
 	if status == http.StatusUnauthorized {
-		// 与 claimUGOne / fetchUGActivities 同口径：凭证失效就终止整轮。
+		// 与 runUGPost / fetchUGActivities 同口径：凭证失效就终止整轮。
 		// 继续打剩下的活动只会拿同一个 401，宿主也看不到「需要重新登录」。
 		result.Status = UGFailed
 		result.Message = "登录态已失效（HTTP 401），请重新登录后再领取"
@@ -1337,6 +1418,28 @@ func worthReporting(a ugActivity, now time.Time) bool {
 		return false
 	}
 	return a.grantable() || a.granted() || a.autoGrant()
+}
+
+// activityStatusToken 把一条活动压成机器可读状态（供控制台的活动状态表）。
+//
+// 用短 token 而不是中文：控制台要按它上色/过滤，文案改动不该影响判断逻辑。
+func activityStatusToken(a ugActivity, now time.Time) string {
+	switch {
+	case a.expired(now):
+		return "ended"
+	case a.notStarted(now):
+		return "not_started"
+	case a.granted():
+		return "claimed"
+	case a.needsManualAction():
+		return "prereq"
+	case a.grantable():
+		return "claimable"
+	case a.autoGrant():
+		return "auto"
+	default:
+		return "unavailable"
+	}
 }
 
 // describeActivity 把一条活动压成总览行（不发请求）。

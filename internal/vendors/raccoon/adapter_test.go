@@ -1,7 +1,11 @@
 package raccoon
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -235,7 +239,9 @@ func TestParseCallbackCode(t *testing.T) {
 		want bool
 	}{
 		{"official scheme", "office-raccoon://auth/callback?code=ac_1&state=s1", "ac_1", true},
-		{"loopback callback rejected (authorize-page flow only)", "http://127.0.0.1:17867/auth/callback?code=ac_2&state=s2", "", false},
+		{"loopback callback", "http://127.0.0.1:37913/auth/callback?code=ac_2&state=s2", "ac_2", true},
+		{"loopback localhost random port", "http://localhost:52111/auth/callback?code=ac_3&state=s3", "ac_3", true},
+		{"loopback foreign host", "http://evil.com/auth/callback?code=x", "", false},
 		{"evil host", "office-raccoon://evil.com/callback?code=x", "", false},
 		{"wrong path", "http://127.0.0.1:1/other?code=x", "", false},
 		{"garbage", "not a url ::", "", false},
@@ -251,9 +257,20 @@ func TestParseCallbackCode(t *testing.T) {
 }
 
 func TestAuthorizeURL(t *testing.T) {
-	got := AuthorizeURLWith("https://x.test", "办公小浣熊客户端", "st")
+	redirect := CallbackURL()
+	got := AuthorizeURLWith("https://x.test", "办公小浣熊客户端", "st", redirect)
 	if !strings.HasPrefix(got, "https://x.test/code/authorize?") || !strings.Contains(got, "state=st") {
 		t.Fatalf("AuthorizeURLWith = %q", got)
+	}
+	// 授权页只认 appname（不是 app_name），并且必须被要求回跳 loopback：
+	// 深链会被官方客户端截走，插件拿不到 code。
+	for _, want := range []string{"desktop_callback=loopback", "redirect=" + url.QueryEscape(redirect), "appname="} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("AuthorizeURLWith = %q, 缺少 %q", got, want)
+		}
+	}
+	if strings.Contains(got, "app_name=") {
+		t.Fatalf("AuthorizeURLWith = %q, 授权页不认 app_name", got)
 	}
 }
 
@@ -273,5 +290,74 @@ func TestClassifyByStatusAndText(t *testing.T) {
 	}
 	if f := ClassifyBusiness(200, 14018, "额度不足"); f.Kind != core.FailureKindHardCredit {
 		t.Fatalf("14018 kind = %q", f.Kind)
+	}
+}
+
+// TestCallbackCatcherLifecycle 锁住「监听随会话结束释放」：起得来、登记可见、
+// 停掉后立刻不可见，重复停止不 panic。端口被占时退到随机端口也算成功。
+func TestCallbackCatcherLifecycle(t *testing.T) {
+	sessionID := "raccoon_test_" + core.RandomHex(4)
+	redirect, listening := startCallbackCatcher(sessionID, "st", func(context.Context, string) (string, error) {
+		return "ok", nil
+	})
+	if !listening {
+		t.Skip("本机没有可用的回环端口")
+	}
+	if redirect != CallbackURL() && !strings.HasPrefix(redirect, "http://127.0.0.1:") {
+		t.Fatalf("redirect = %q", redirect)
+	}
+	if _, okListening := callbackListening(sessionID); !okListening {
+		t.Fatal("监听启动后应能按会话查到")
+	}
+	stopCallbackCatcher(sessionID)
+	if _, okListening := callbackListening(sessionID); okListening {
+		t.Fatal("停止后监听登记必须清掉，否则端口会被占到 TTL")
+	}
+	stopCallbackCatcher(sessionID)
+}
+
+// TestPendingLoginResultHandoff 锁住「回调换票 → 轮询落盘」的交接：
+// 回调线程写入、轮询线程取走，且只能取一次。
+//
+// 这条链路断掉的表现很隐蔽：浏览器页面显示登录成功，账号库里却没有这个
+// 账号——凭证在回调线程里被丢掉了。
+func TestPendingLoginResultHandoff(t *testing.T) {
+	pending := &PendingLogin{State: "s1"}
+	if pending.TakeResult() != nil {
+		t.Fatal("还没有结果时不应取出任何东西")
+	}
+	result := &core.CallbackSubmitResult{Message: "小浣熊登录成功"}
+	pending.StoreResult(result)
+	if got := pending.TakeResult(); got != result {
+		t.Fatalf("应取回回调写入的那条结果，得到 %+v", got)
+	}
+	if pending.TakeResult() != nil {
+		t.Fatal("结果是一次性的，第二次取必须为空")
+	}
+}
+
+// TestCallbackCatcherRejectsWrongState 锁住回调的 state 校验。
+//
+// 本机任何程序都能往回环端口丢请求；不校验 state 就等于允许别人用自己的
+// code 覆盖当前这次登录。
+func TestCallbackCatcherRejectsWrongState(t *testing.T) {
+	catcher := &callbackCatcher{state: "expected", onCode: func(context.Context, string) (string, error) {
+		t.Fatal("state 不匹配时不得调用换票")
+		return "", nil
+	}}
+	request := httptest.NewRequest(http.MethodGet, CallbackPath+"?code=c1&state=other", nil)
+	request.RemoteAddr = "127.0.0.1:54321"
+	recorder := httptest.NewRecorder()
+	catcher.handle(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", recorder.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, CallbackPath+"?code=c1&state=expected", nil)
+	request.RemoteAddr = "10.0.0.9:54321"
+	recorder = httptest.NewRecorder()
+	catcher.handle(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("非本机来源 status = %d, want 403", recorder.Code)
 	}
 }

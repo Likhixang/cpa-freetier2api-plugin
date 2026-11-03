@@ -1,10 +1,12 @@
-// Package logger 提供插件内日志：内存环 + stderr + 可选按天文件。
+// Package logger 提供插件内日志：内存环 + stderr + 可选按天文件 + 宿主日志镜像。
 //
-// 三处刻意的设计：
+// 四处刻意的设计：
 //   - sink 用 stderr 而非 stdout：动态库被 CPA 宿主加载，stdout 属于宿主进程，
 //     往 stdout 写会污染宿主的正常输出；
 //   - 内存环供管理页按 since 增量拉取最近日志（宿主日志里翻插件日志很不方便）；
-//   - 按天文件可选，默认关闭，只保留最近 N 天。
+//   - 按天文件可选，默认关闭，只保留最近 N 天；
+//   - 宿主日志镜像是唯一进面板的通道：宿主的日志页只读 <auth-dir>/logs/main.log
+//     （见 hostsink.go）。
 //
 // 安全约定：调用方不得把完整凭证写入日志，只允许输出前缀。
 package logger
@@ -62,17 +64,20 @@ var (
 	fileDir  string
 )
 
-// SetLevel 设置日志级别。接受 debug / info / error，未知值回落 info。
-func SetLevel(raw string) {
+// LevelFromName 把级别名转成 Level，未知值按 info 处理。
+func LevelFromName(raw string) Level {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "debug":
-		setLevel(LevelDebug)
+		return LevelDebug
 	case "error":
-		setLevel(LevelError)
+		return LevelError
 	default:
-		setLevel(LevelInfo)
+		return LevelInfo
 	}
 }
+
+// SetLevel 设置日志级别。接受 debug / info / error，未知值回落 info。
+func SetLevel(raw string) { setLevel(LevelFromName(raw)) }
 
 func setLevel(lvl Level) {
 	levelMu.Lock()
@@ -163,15 +168,17 @@ func pruneLogFiles(dir string) {
 	}
 }
 
-// Close 关闭文件 sink。供 shutdown 调用。
+// Close 关闭文件 sink 与宿主日志镜像。供 shutdown 调用。
 func Close() {
 	fileMu.Lock()
-	defer fileMu.Unlock()
 	if fileSink != nil {
 		_ = fileSink.Close()
 		fileSink = nil
 		fileDay = ""
 	}
+	fileMu.Unlock()
+
+	CloseHostSink()
 }
 
 // Debug 记录一条 debug 日志。
@@ -201,6 +208,9 @@ func log(lvl Level, label string, format string, args ...any) {
 		Level:   strings.ToLower(label),
 		Message: message,
 	})
+
+	// 镜像进宿主 main.log：面板的日志页只读那个文件。
+	hostLog.enqueue(hostRecord{at: now, lvl: lvl, label: label, message: message})
 
 	fileMu.Lock()
 	if fileSink != nil {

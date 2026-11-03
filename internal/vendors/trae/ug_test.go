@@ -43,14 +43,15 @@ func ugTestConfig(t *testing.T, host string) Config {
 // 那条链路已删除——留着它只会是一个永远调不到的实现。
 //
 // cobrand/claim 与两个 share_link 需要活动 ID / 作品 ID（上游实测回
-// 4001 / 9080「param is invalid」），插件取不到，同样不进批量入口：每轮白打
-// 3 次注定失败的请求，只会拖慢整轮并把真实原因糊成「暂不可领」。
+// 4001 / 9080「param is invalid」），插件取不到：它们仍登记在动作表里并标记
+// needs_input，但不得出现在批量入口——每轮白打 3 次注定失败的请求，只会拖慢
+// 整轮并把真实原因糊成「暂不可领」。
 func TestUGActionsAreBatchable(t *testing.T) {
 	actions := UGActions()
 	if len(actions) != 2 {
 		t.Fatalf("活动入口数 = %d, 期望 2（竞赛奖励 + 作品抽奖）", len(actions))
 	}
-	// 需要入参的端点已从代码里删掉（连常量一起），这里用路径字面量做黑名单，
+	// 需要入参的端点不得进批量入口，这里用路径字面量做黑名单，
 	// 防止日后有人凭记忆把它们加回批量入口。
 	for _, excluded := range []string{
 		"/trae/api/v2/ug/cobrand/claim",
@@ -1209,6 +1210,82 @@ func TestUGAlreadyDoesNotRepeatItself(t *testing.T) {
 		got := UGResult{Label: "每日签到", Status: UGAlready, Message: c.message}.Describe()
 		if got != c.want {
 			t.Fatalf("%s: Describe() = %q，want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestUGEndpointTableIsConsistent 锁住动作表的两个不变量：
+//   - 需要入参的端点不进批量入口（否则每轮白打注定 4001 的请求）；
+//   - 每个端点都有 key/label/path 与调用函数，key 不重复。
+func TestUGEndpointTableIsConsistent(t *testing.T) {
+	seen := map[string]bool{}
+	for _, endpoint := range ugEndpointTable {
+		if endpoint.Key == "" || endpoint.Label == "" || endpoint.Path == "" || endpoint.Run == nil {
+			t.Fatalf("%q: key/label/path/run 都不能为空", endpoint.Key)
+		}
+		if seen[endpoint.Key] {
+			t.Fatalf("动作 key 重复: %s", endpoint.Key)
+		}
+		seen[endpoint.Key] = true
+	}
+	for _, action := range UGActions() {
+		if endpoint, okEndpoint := ugEndpointByKey(action.Key); !okEndpoint || endpoint.NeedsInput {
+			t.Fatalf("批量入口里出现了需要入参的端点: %s", action.Key)
+		}
+	}
+	for _, endpoint := range ugEndpointTable {
+		if !endpoint.NeedsInput {
+			continue
+		}
+		for _, action := range UGActions() {
+			if action.Key == endpoint.Key {
+				t.Fatalf("需要入参的端点不该进批量入口: %s", endpoint.Key)
+			}
+		}
+	}
+}
+
+// TestRunUGNeedsInputSkipsRequest 锁住「缺入参的动作不发请求」：
+// 直接返回暂不可领，而不是打一次注定失败的请求再把它包装成故障。
+func TestRunUGNeedsInputSkipsRequest(t *testing.T) {
+	endpoint, okEndpoint := ugEndpointByKey("cobrand_claim")
+	if !okEndpoint {
+		t.Fatal("动作表里应登记 cobrand_claim")
+	}
+	if !endpoint.NeedsInput {
+		t.Fatal("cobrand_claim 需要活动 ID，应标记 needs_input")
+	}
+	// 指向不可达主机：一旦真发请求就会得到 UGFailed。
+	result, errRun := endpoint.Run(context.Background(), ugTestConfig(t, "http://127.0.0.1:1"), nil, endpoint)
+	if errRun != nil {
+		t.Fatalf("缺入参不应返回错误: %v", errRun)
+	}
+	if result.Status != UGUnavailable {
+		t.Fatalf("status = %v, 期望 UGUnavailable", result.Status)
+	}
+}
+
+// TestUGAutoStatusThreeStates 锁住一键任务的三态映射：
+// 领到 = done、只有失败 = error、已领/暂不可领 = skipped。
+//
+// 把「无事可做」算成 done 会让用户以为今天领到了东西；把「跳过」算成 error
+// 会让正常账号在日志里天天刷红。
+func TestUGAutoStatusThreeStates(t *testing.T) {
+	cases := []struct {
+		name    string
+		results []UGResult
+		want    string
+	}{
+		{"没有入口", nil, core.AutoStatusSkipped},
+		{"领到一项", []UGResult{{Status: UGClaimed}, {Status: UGUnavailable}}, core.AutoStatusDone},
+		{"全部失败", []UGResult{{Status: UGFailed}, {Status: UGFailed}}, core.AutoStatusError},
+		{"已领过", []UGResult{{Status: UGAlready}, {Status: UGUnavailable}}, core.AutoStatusSkipped},
+		{"部分失败但有已领", []UGResult{{Status: UGFailed}, {Status: UGAlready}}, core.AutoStatusSkipped},
+		{"待前置", []UGResult{{Status: UGNeedsPrereq}}, core.AutoStatusSkipped},
+	}
+	for _, testCase := range cases {
+		if got, _ := ugAutoStatus(testCase.results); got != testCase.want {
+			t.Fatalf("%s: ugAutoStatus = %q, want %q", testCase.name, got, testCase.want)
 		}
 	}
 }

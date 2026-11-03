@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/internal/core"
 )
 
 // 空分片保护：宿主短暂没有数据时退避；宿主持续异常时及时终止，避免永久空转。
@@ -350,10 +351,13 @@ func (b *streamBody) Close() error {
 }
 
 // truncateForError 截断用于错误信息的响应体，避免把整页 HTML 塞进日志。
+//
+// 按 UTF-8 字符边界截断：上游错误页多为中文，按字节切会把最后一个字符劈成
+// 半个非法序列，日志与错误帧里就会带一串替换字符。
 func truncateForError(raw []byte) string {
 	const limit = 256
 	if len(raw) <= limit {
 		return string(raw)
 	}
-	return string(raw[:limit]) + "..."
+	return core.TrimToBytes(string(raw), limit) + "..."
 }

@@ -47,6 +47,38 @@ func (a *App) decodeConfig(raw []byte) (pluginConfig, error) {
 	return cfg, nil
 }
 
+const (
+	// 宿主日志镜像的三个配置键。
+	//
+	// 只从原始键值表解析，不进 admin.PluginConfig：那三个字段被管理接口当作
+	// 「页面可写设置」使用，把日志镜像的路径也做成可改项，会让页面能指到任意
+	// 文件；而镜像的目标本来就该跟着宿主的 auth-dir 走。
+	logToHostKey    = "log_to_host"
+	hostLogFileKey  = "host_log_file"
+	hostLogLevelKey = "host_log_level"
+)
+
+// hostLogSettings 把三个配置键翻成日志层能直接消费的开关。
+//
+// 默认开启：插件日志在面板里不可见本身就是缺陷，不该要求运维先改配置才能排查。
+func hostLogSettings(cfg pluginConfig) logger.HostSinkOptions {
+	opts := logger.HostSinkOptions{
+		Enabled:  true,
+		StateDir: cfg.StateDir,
+		MinLevel: logger.LevelFromName(admin.DefaultLogLevel),
+	}
+	if raw, ok := cfg.Raw[logToHostKey]; ok {
+		opts.Enabled = admin.ParseBool(raw, opts.Enabled)
+	}
+	if raw, ok := cfg.Raw[hostLogFileKey]; ok {
+		opts.Path = strings.TrimSpace(raw)
+	}
+	if raw, ok := cfg.Raw[hostLogLevelKey]; ok {
+		opts.MinLevel = logger.LevelFromName(raw)
+	}
+	return opts
+}
+
 // ApplyConfig 应用配置：初始化日志与状态目录、设置指纹盐、下发供应商配置。
 func (a *App) ApplyConfig(cfg pluginConfig) error {
 	if errDir := ensureStateDir(cfg); errDir != nil {
@@ -56,6 +88,7 @@ func (a *App) ApplyConfig(cfg pluginConfig) error {
 	if errLog := logger.InitFile(cfg.LogToFile, filepath.Join(cfg.StateDir, "logs")); errLog != nil {
 		logger.Error("init log file sink failed: %v", errLog)
 	}
+	logger.InitHostSink(hostLogSettings(cfg))
 	a.store.Configure(cfg.StateDir)
 	salt, errSalt := a.ensureMachineSalt(cfg)
 	if errSalt != nil {

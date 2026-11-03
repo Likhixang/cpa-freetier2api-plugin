@@ -68,6 +68,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
 // hostAPI 保存宿主在 cliproxy_plugin_init 传入的函数表指针。
@@ -190,6 +191,10 @@ const (
 func cliproxyPluginShutdown() {
 	pluginApp.StopBackgroundWork()
 	pluginApp.WaitPluginStreams(shutdownWaitTimeout)
+	// 日志 sink 必须在排空之后、hostAPI 清空之前关闭：宿主不一定会先调
+	// plugin.quiesce，漏掉这一句会让队列里最后几条日志连同 host sink 的缓冲
+	// 一起丢掉。
+	logger.Close()
 	hostbridge.WaitForShutdown(shutdownDiagnosticInterval)
 	hostAPI = nil
 }

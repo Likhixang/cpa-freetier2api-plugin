@@ -288,6 +288,11 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 func (v *adapter) localMachineIdentity() MachineIdentity {
 	v.localIdentity.once.Do(func() {
 		v.localIdentity.value = LocalMachineIdentity(v.region)
+		if !v.localIdentity.value.Native() {
+			// 没装客户端不算错误，但必须留下可操作的出路：只说「拿不到身份」
+			// 会让用户在「国际版看不到活动」上反复排查。
+			logger.Info("qoder: 本机未取到设备身份（vendor=%s）：%s", v.ID(), MachineIdentityHint(v.region))
+		}
 	})
 	return v.localIdentity.value
 }
@@ -301,11 +306,15 @@ func (v *adapter) settingsSnapshot() map[string]string {
 }
 
 // ConfigFields 声明 Qoder 专属 YAML 配置。
+//
+// 设备身份（machineToken/machineType）是国际版活动可见性的前提：本机装了官方
+// 客户端时插件自己 spawn 组件取，没装就必须手工填。这里的说明写清「值从哪
+// 来、填到哪」，与凭证文件里的 machine_token / machine_type 是同一对值。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
 		{Name: "qoder_desktop_version", Type: pluginapi.ConfigFieldTypeString, Description: "cosy-version 桌面端版本覆盖。"},
-		{Name: "qoder_machine_token", Type: pluginapi.ConfigFieldTypeString, Description: "官方组件签发的 machineToken，用于解锁国际版每日领取活动。"},
-		{Name: "qoder_machine_type", Type: pluginapi.ConfigFieldTypeString, Description: "与 qoder_machine_token 配对的 machineType，必须成对填写。"},
+		{Name: "qoder_machine_token", Type: pluginapi.ConfigFieldTypeString, Description: "官方组件 runtime-info 签发的 machineToken（等价于凭证字段 machine_token）。没装客户端时：在登录过 Qoder 的机器上运行 runtime-info <environment> --account-stdin，取输出里的 machineToken 填到这里。"},
+		{Name: "qoder_machine_type", Type: pluginapi.ConfigFieldTypeString, Description: "与 qoder_machine_token 配对的 machineType（等价于凭证字段 machine_type），必须成对填写，单独一个不生效。"},
 		{Name: "qoder_machine_code", Type: pluginapi.ConfigFieldTypeString, Description: "可选的 machineCode（不填不影响活动可见性）。"},
 	}
 }
@@ -343,7 +352,10 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
 	plan := FetchPlanName(ctx, result.Token, result.Region)
-	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan)
+	// 设备身份：登录这台机器上若装过官方客户端，直接把 runtime-info 签发的
+	// machineToken/machineType 写进凭证——国际版活动按它精确校验，缺了就只能
+	// 看到「无可用签到活动」。拿不到时留空，由用户手工补（见 MachineIdentityHint）。
+	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan, v.localMachineIdentity())
 	authID := LoginAuthID(result.Profile, state)
 	fileName := core.FileNameFor(v.ID(), strings.TrimPrefix(authID, "qoder-"))
 	logger.Info("completed qoder login (vendor=%s email=%s)", v.ID(), cred.Email)
@@ -535,6 +547,31 @@ func (r *payloadRecorder) Payload() []byte { return r.body }
 
 func (v *adapter) SupportsCheckin() bool { return true }
 
+// ---- 一键任务 ----
+
+// RunAllTasks 执行一键任务。
+//
+// Qoder 的活动福利只有一条链路：每日领取会把当天开放的 campaign 一并领掉，
+// 协议层的 Checkin 已经覆盖，所以这里只产出签到那一行，不额外造空行。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	if row := core.BuildCheckinAutoTask(ctx, v, cred); row != nil {
+		return []core.AutoTaskResult{*row}
+	}
+	return nil
+}
+
+// RunTask 执行单条任务。Qoder 可自动执行的动作只有签到/活动领取。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != core.AutoTaskCodeCheckin {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	row := core.BuildCheckinAutoTask(ctx, v, cred)
+	if row == nil {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+	}
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -547,4 +584,5 @@ var (
 	_ core.ModelsProvider       = (*adapter)(nil)
 	_ core.QuotaProvider        = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

@@ -21,6 +21,8 @@ func TestConsumptionRateParsesVariants(t *testing.T) {
 		{"zero is legal", `{"consumption_rate":{"data":{"rate":0}}}`, "0"},
 		{"disabled at rate", `{"consumption_rate":{"enable":false,"data":{"rate":0.9}}}`, ""},
 		{"disabled at data", `{"consumption_rate":{"data":{"enable":false,"rate":0.9}}}`, ""},
+		// 上游把整个配置对象序列化成字符串下发：按对象直解会静默变成「没有倍率」。
+		{"string-encoded object", `"{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.55}}}"`, "0.55"},
 		{"missing", `{}`, ""},
 		{"null", ``, ""},
 	}

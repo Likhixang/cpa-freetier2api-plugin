@@ -2,6 +2,7 @@ package codearts
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -594,7 +595,31 @@ func buildDPoPProof(jwk map[string]string, htu string) (string, error) {
 	xStr := jwk["x"]
 	yStr := jwk["y"]
 	if xStr == "" || yStr == "" {
-		x, y := curve.ScalarBaseMult(dRaw)
+		// 用 crypto/ecdh 从私钥标量推导公钥点（elliptic.ScalarBaseMult 已弃用）。
+		//
+		// ecdh.P256().NewPrivateKey 要求标量恰好 32 字节且在 [1, N-1] 内，
+		// 而 JWK 的 d 来自上游，长度不保证：短的按高位补零、超长的取尾 32 字节
+		// 归一化。归一后它与 ScalarBaseMult 等价——两者都是 NIST P-256 上的
+		// d·G，PublicKey().Bytes() 给出未压缩点 0x04||X||Y（65 字节），
+		// 后 64 字节正是 32 字节大端的 X 与 Y，与 pad(x, 32)/pad(y, 32) 同形。
+		scalar := make([]byte, 32)
+		switch {
+		case len(dRaw) >= 32:
+			copy(scalar, dRaw[len(dRaw)-32:])
+		case len(dRaw) > 0:
+			copy(scalar[32-len(dRaw):], dRaw)
+		}
+		ecdhPriv, errEcdh := ecdh.P256().NewPrivateKey(scalar)
+		if errEcdh != nil {
+			// 零标量或越界：不是可用的 P-256 私钥，报错而不是编一个公钥。
+			return "", fmt.Errorf("derive dpop public key failed: %w", errEcdh)
+		}
+		pub := ecdhPriv.PublicKey().Bytes()
+		if len(pub) != 65 || pub[0] != 0x04 {
+			return "", fmt.Errorf("derive dpop public key failed: unexpected point encoding")
+		}
+		x := new(big.Int).SetBytes(pub[1:33])
+		y := new(big.Int).SetBytes(pub[33:65])
 		xStr = base64.RawURLEncoding.EncodeToString(pad(x, 32))
 		yStr = base64.RawURLEncoding.EncodeToString(pad(y, 32))
 		jwk["x"] = xStr

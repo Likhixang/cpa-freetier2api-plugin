@@ -68,6 +68,13 @@ func (v *adapter) fetchModels(ctx context.Context, cred *Credential) ([]Model, e
 	return parseBuiltinModels(body)
 }
 
+// VetoModelFallback 实现 core.ModelFallbackVeto。
+//
+// 积分通道下这份清单就是「能推哪些模型」的判据：探测失败时回落到上次的清单
+// 等于继续推广可能已无权限的模型，必须如实返回空。福利通道的清单是账号无关
+// 目录，探测失败时回落只是恢复可用性。
+func (v *adapter) VetoModelFallback() bool { return v.creditEnabled.Load() }
+
 // Instances 构造 CodeArts 实例（单一部署，国内区）。
 func Instances(env core.Env) []core.Vendor {
 	return []core.Vendor{&adapter{NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
@@ -351,6 +358,54 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	return SubmitCallback(ctx, v.Env.Logins, state, rawURL)
 }
 
+// ---- 一键任务 ----
+
+// RunAllTasks 执行一键任务：先签到（积分签到 + 每日登录活动 + 福利 Token 通道），
+// 再把活动列表里剩下的可领活动一并领掉。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, len(autoTasks)+1)
+	if row := core.BuildCheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{
+			Code:    AutoTaskCodeOpsBenefit,
+			Status:  core.AutoStatusError,
+			Message: "账号：" + errNative.Error(),
+		})
+	}
+	return append(results, runAutoTasks(ctx, autoTasks, &autoRun{cred: native})...)
+}
+
+// RunTask 执行单条任务；未知任务码如实跳过。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.BuildCheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+		}
+		return taskRunResultOf(*row), nil
+	}
+	task, okTask := autoTaskFor(trimmed)
+	if !okTask {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskRunResult{}, errNative
+	}
+	return taskRunResultOf(task.run(ctx, &autoRun{cred: native})), nil
+}
+
+// taskRunResultOf 把一键任务的一行折成单任务结果。
+func taskRunResultOf(row core.AutoTaskResult) core.TaskRunResult {
+	return core.TaskRunResult{
+		Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy,
+	}
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -362,4 +417,5 @@ var (
 	_ core.CreditsProvider      = (*adapter)(nil)
 	_ core.Configurable         = (*adapter)(nil)
 	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

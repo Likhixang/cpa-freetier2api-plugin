@@ -1378,16 +1378,77 @@ func mergeTasks(primary, extra []Task) []Task {
 
 // ---- 任务执行 ----
 
+// 一键任务里代表各活动族的任务码。它们与定时排程的 kind 一一对应，
+// 复用 RunScheduled 的实现，避免一键任务与排程两套逻辑各自漂移。
+const (
+	AutoTaskCodeTravel   = "(猫猫旅行)"
+	AutoTaskCodeActivity = "(活跃上报)"
+	AutoTaskCodeBlackcat = "(夜猫子)"
+	AutoTaskCodeSchool   = "(开学季)"
+	AutoTaskCodeStreak   = "(连登奖励)"
+)
+
+// autoActivityRow 是一键任务里「活动族」那一行。
+type autoActivityRow struct {
+	Code   string
+	Label  string
+	Family string
+	// Skip 返回非空原因时本行跳过（例如不在夜间窗口）。
+	Skip func(now time.Time) string
+}
+
+// autoActivityRows 是活动族任务表（顺序即依赖序）。
+var autoActivityRows = []autoActivityRow{
+	{Code: AutoTaskCodeTravel, Label: "猫猫旅行", Family: TaskKindTravel},
+	{Code: AutoTaskCodeActivity, Label: "活跃上报", Family: TaskKindActivity},
+	{
+		Code: AutoTaskCodeBlackcat, Label: "夜猫子", Family: TaskKindBlackcat,
+		Skip: func(now time.Time) string {
+			if InNightWindow(now) {
+				return ""
+			}
+			return "当前不在 23:00-08:00 计分窗口，排程会在夜间自动补足"
+		},
+	},
+	{Code: AutoTaskCodeSchool, Label: "开学季", Family: TaskKindSchool},
+	{Code: AutoTaskCodeStreak, Label: "连登奖励", Family: TaskKindStreak},
+}
+
+// activityRowFor 按任务码查活动族表。
+func activityRowFor(code string) (autoActivityRow, bool) {
+	trimmed := strings.TrimSpace(code)
+	for _, row := range autoActivityRows {
+		if row.Code == trimmed {
+			return row, true
+		}
+	}
+	return autoActivityRow{}, false
+}
+
 func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.BuildCheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+		}
+		return core.TaskRunResult{
+			Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy,
+		}, nil
+	}
+	// 活动族：与一键任务里那几行走同一套 RunScheduled。
+	if row, okRow := activityRowFor(trimmed); okRow {
+		return v.runActivityRow(ctx, cred, row), nil
+	}
 	if v.region.IsGlobal() {
-		return core.TaskRunResult{Status: "skipped", Message: "国际版账号没有成长任务"}, nil
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "国际版账号没有成长任务"}, nil
 	}
 	native, err := v.Native(cred)
 	if err != nil {
 		return core.TaskRunResult{}, err
 	}
 	client := v.client(ctx)
-	if strings.TrimSpace(code) == "school_daily" {
+	if trimmed == "school_daily" {
 		message, errRun := RunSchool(ctx, client, native)
 		if errRun != nil {
 			return core.TaskRunResult{}, errRun
@@ -1395,13 +1456,13 @@ func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code strin
 		if message == "" {
 			message = "开学季无需动作（活动期外或已完成）"
 		}
-		return core.TaskRunResult{Status: "done", Message: message}, nil
+		return core.TaskRunResult{Status: core.AutoStatusDone, Message: message}, nil
 	}
-	message, credit, energy, errRun := runGrowthTask(ctx, client, native, code)
+	message, credit, energy, errRun := runGrowthTask(ctx, client, native, trimmed)
 	if errRun != nil {
 		return core.TaskRunResult{}, errRun
 	}
-	return core.TaskRunResult{Status: "done", Message: message, Credit: credit, Energy: energy}, nil
+	return core.TaskRunResult{Status: core.AutoStatusDone, Message: message, Credit: credit, Energy: energy}, nil
 }
 
 // PrepareTasks 批量报名未接受的任务（队列与一键完成的前置）。
@@ -1416,60 +1477,116 @@ func (v *adapter) PrepareTasks(ctx context.Context, cred *core.Credential) int {
 	return acceptPendingTasks(ctx, v.client(ctx), native)
 }
 
+// RunAllTasks 执行一键任务。
+//
+// 三段，顺序即依赖序：
+//  1. 签到（core 统一实现）——当日主福利，也是活跃/连登类任务的前置；
+//  2. 成长任务（autoActions 表）：批量报名 → 逐个做 → 领奖；
+//  3. 活动族（autoActivityRows 表）：复用 RunScheduled，与定时排程同一套实现。
+//
+// 每一行都落到 done / skipped / error 三态之一，跳过必须带原因。
 func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
-	if v.region.IsGlobal() {
-		return nil
+	results := make([]core.AutoTaskResult, 0, len(autoActions)+len(autoActivityRows)+2)
+	if row := core.BuildCheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
 	}
 	native, err := v.Native(cred)
 	if err != nil {
-		return []core.AutoTaskResult{{Code: "(账号)", Status: "error", Message: err.Error()}}
+		return append(results, core.AutoTaskResult{
+			Code: "(账号)", Status: core.AutoStatusError, Message: err.Error(),
+		})
+	}
+	if v.region.IsGlobal() {
+		// 国际版没有成长任务体系：可自动领取的福利只有每日活跃奖励，
+		// 已由上面的签到行覆盖，这里不再补空行。
+		return results
 	}
 	client := v.client(ctx)
-	results := make([]core.AutoTaskResult, 0, len(autoActions)+1)
 	if accepted := acceptPendingTasks(ctx, client, native); accepted > 0 {
 		results = append(results, core.AutoTaskResult{
-			Code: "(批量报名)", Status: "done",
+			Code: "(批量报名)", Status: core.AutoStatusDone,
 			Message: fmt.Sprintf("报名 %d 个任务", accepted),
 		})
 		core.SleepContext(ctx, 1050*time.Millisecond)
 	}
 	for _, action := range autoActions {
-		task, errTask := findGrowthTask(ctx, client, native, action.Code)
-		if errTask != nil {
-			results = append(results, core.AutoTaskResult{Code: action.Code, Status: "error", Message: errTask.Error()})
-			continue
-		}
-		if task == nil {
-			results = append(results, core.AutoTaskResult{Code: action.Code, Status: "skipped", Message: "该账号无此任务"})
-			continue
-		}
-		if task.Claimed {
-			results = append(results, core.AutoTaskResult{Code: action.Code, Status: "skipped", Message: "已领取过奖励"})
-			continue
-		}
-		if action.Code == "black_cat" && !InNightWindow(time.Now()) {
-			results = append(results, core.AutoTaskResult{
-				Code: action.Code, Status: "skipped",
-				Message: "当前不在 23:00-08:00 计分窗口，排程会在夜间自动补足",
-			})
-			continue
-		}
-		message, credit, energy, errRun := runGrowthTask(ctx, client, native, action.Code)
-		result := core.AutoTaskResult{Code: action.Code, Credit: credit, Energy: energy}
-		if errRun != nil {
-			result.Status = "error"
-			result.Message = errRun.Error()
-		} else {
-			result.Status = "done"
-			result.Message = message
-		}
-		if latest, errLatest := findGrowthTask(ctx, client, native, action.Code); errLatest == nil && latest != nil {
-			result.Progress = fmt.Sprintf("%d/%d", latest.Current, latest.Target)
-		}
-		results = append(results, result)
+		results = append(results, runGrowthRow(ctx, client, native, action))
 		core.SleepContext(ctx, 1050*time.Millisecond)
 	}
+	for _, row := range autoActivityRows {
+		res := v.runActivityRow(ctx, cred, row)
+		results = append(results, core.AutoTaskResult{
+			Code:    row.Code,
+			Status:  res.Status,
+			Message: res.Message,
+			Credit:  res.Credit,
+			Energy:  res.Energy,
+		})
+	}
 	return results
+}
+
+// runGrowthRow 执行一条成长任务并折成三态结果。
+//
+// 领奖进度（Progress）在动作之后重新查一次：任务刚完成时上游列表最终一致，
+// 拿不到就留空，不编造进度。
+func runGrowthRow(ctx context.Context, client *Client, native *Credential, action taskAction) core.AutoTaskResult {
+	result := core.AutoTaskResult{Code: action.Code}
+	task, errTask := findGrowthTask(ctx, client, native, action.Code)
+	if errTask != nil {
+		result.Status = core.AutoStatusError
+		result.Message = errTask.Error()
+		return result
+	}
+	if task == nil {
+		result.Status = core.AutoStatusSkipped
+		result.Message = "该账号无此任务"
+		return result
+	}
+	if task.Claimed {
+		result.Status = core.AutoStatusSkipped
+		result.Message = "已领取过奖励"
+		return result
+	}
+	if action.Code == "black_cat" && !InNightWindow(time.Now()) {
+		result.Status = core.AutoStatusSkipped
+		result.Message = "当前不在 23:00-08:00 计分窗口，排程会在夜间自动补足"
+		return result
+	}
+	message, credit, energy, errRun := runGrowthTask(ctx, client, native, action.Code)
+	result.Credit, result.Energy = credit, energy
+	if errRun != nil {
+		result.Status = core.AutoStatusError
+		result.Message = errRun.Error()
+		return result
+	}
+	result.Status = core.AutoStatusDone
+	result.Message = message
+	if latest, errLatest := findGrowthTask(ctx, client, native, action.Code); errLatest == nil && latest != nil {
+		result.Progress = fmt.Sprintf("%d/%d", latest.Current, latest.Target)
+	}
+	return result
+}
+
+// runActivityRow 执行一条活动族任务。
+//
+// 空消息表示本次无需动作（不在窗口 / 活动期外 / 已完成），如实记 skipped，
+// 不能记 done——那会让用户以为今天领到了东西。
+func (v *adapter) runActivityRow(ctx context.Context, cred *core.Credential, row autoActivityRow) core.TaskRunResult {
+	if row.Skip != nil {
+		if reason := row.Skip(time.Now()); reason != "" {
+			return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: reason}
+		}
+	}
+	message, errRun := v.RunScheduled(ctx, cred, row.Family)
+	switch {
+	case errRun != nil:
+		return core.TaskRunResult{Status: core.AutoStatusError, Message: row.Label + "：" + errRun.Error()}
+	case strings.TrimSpace(message) == "":
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "当前无需动作（不在窗口或已完成）"}
+	default:
+		return core.TaskRunResult{Status: core.AutoStatusDone, Message: message}
+	}
 }
 
 func runGrowthTask(ctx context.Context, client *Client, credential *Credential, code string) (string, int64, int64, error) {
@@ -1517,19 +1634,25 @@ func waitGrowthClaimable(ctx context.Context, client *Client, credential *Creden
 	if mp {
 		attempts = 2
 	}
-	for attempt := 1; attempt < attempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// 先查后等：动作刚做完时多数任务已经可领，无脑先睡 3 秒是白等。
+		task, errTask := findGrowthTask(ctx, client, credential, code)
+		if errTask == nil {
+			// 已领过是终态，不必再等。
+			if task != nil && task.Claimed {
+				return false
+			}
+			if task != nil && (task.Claimable() || task.Done()) {
+				return true
+			}
+			// task == nil 不能当终态：动作刚做完时上游列表还没把该任务吐出来
+			// （列表最终一致），此刻放弃等于白做任务、拿不到奖励。
+		}
+		if attempt == attempts {
+			break
+		}
 		if !core.SleepContext(ctx, 3*time.Second) {
 			return false
-		}
-		task, errTask := findGrowthTask(ctx, client, credential, code)
-		if errTask != nil {
-			continue
-		}
-		if task == nil || task.Claimed {
-			return false
-		}
-		if task.Claimable() || task.Done() {
-			return true
 		}
 	}
 	return false

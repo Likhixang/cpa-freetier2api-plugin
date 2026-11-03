@@ -386,12 +386,28 @@ func consumptionRate(raw json.RawMessage) string {
 }
 
 // decodeObject 把 JSON 解成键值对表；空值/非对象返回 false。
+//
+// 上游会把内层对象序列化成字符串再下发（display_contact_config 由 object
+// 变成 "{\"...\"}" 这种形态）。按对象直解必然失败，而这条链上没有别的地方
+// 报错，表现为整张表的倍率静默变空。这里对字符串形态补一次二次解析：
+// 内容仍是对象就照常返回，仍是普通文本则按非对象处理。
 func decodeObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, false
 	}
 	var doc map[string]json.RawMessage
-	if errDoc := json.Unmarshal(raw, &doc); errDoc != nil || doc == nil {
+	if errDoc := json.Unmarshal(raw, &doc); errDoc == nil && doc != nil {
+		return doc, true
+	}
+	var text string
+	if errText := json.Unmarshal(raw, &text); errText != nil {
+		return nil, false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || text == "null" {
+		return nil, false
+	}
+	if errDoc := json.Unmarshal([]byte(text), &doc); errDoc != nil || doc == nil {
 		return nil, false
 	}
 	return doc, true

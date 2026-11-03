@@ -335,6 +335,65 @@ func (v *adapter) probeToken() string {
 	return native.AccessTokenValue()
 }
 
+// ---- 一键任务 ----
+
+// RunAllTasks 执行一键任务。
+//
+// 顺序有意义：签到是当日主福利，登录活跃奖励由服务端按签到事件发放，所以
+// 签到先行。签到成功时 Checkin 内部已经上报过登录活跃（见 adapter.Checkin），
+// 这一行就不再重复上报；签到被跳过（今日已签）时由它补一次。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, len(autoTasks)+1)
+	checkin := core.BuildCheckinAutoTask(ctx, v, cred)
+	if checkin != nil {
+		results = append(results, *checkin)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{
+			Code:    AutoTaskCodeLoginActive,
+			Status:  core.AutoStatusError,
+			Message: errNative.Error(),
+		})
+	}
+	run := &autoRun{
+		baseURL: v.resolveBaseURL(),
+		cred:    native,
+		// 签到成功意味着 Checkin 内部已经上报过登录活跃（见 adapter.Checkin）。
+		loginActiveReported: checkin != nil && checkin.Status == core.AutoStatusDone,
+	}
+	return append(results, runAutoTasks(ctx, autoTasks, run)...)
+}
+
+// RunTask 执行单条任务；未知任务码如实跳过，不伪造成功。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.BuildCheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+		}
+		return taskRunResultOf(*row), nil
+	}
+	task, okTask := autoTaskFor(trimmed)
+	if !okTask {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskRunResult{}, errNative
+	}
+	run := &autoRun{baseURL: v.resolveBaseURL(), cred: native}
+	return taskRunResultOf(task.run(ctx, run)), nil
+}
+
+// taskRunResultOf 把一键任务的一行折成单任务结果。
+func taskRunResultOf(row core.AutoTaskResult) core.TaskRunResult {
+	return core.TaskRunResult{
+		Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy,
+	}
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -346,6 +405,7 @@ var (
 	_ core.Refresher            = (*adapter)(nil)
 	_ core.StorageMerger        = (*adapter)(nil)
 	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )
 
 // 编译期断言（登录能力随实例类型分派）。

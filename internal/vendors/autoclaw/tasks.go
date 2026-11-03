@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,6 +87,12 @@ func Checkin(ctx context.Context, baseURL string, cred *Credential) (*CheckinRes
 		if resp.StatusCode >= 400 {
 			return nil, Classify(resp.StatusCode, *envelope.Code, envelope.Msg)
 		}
+		// HTTP 200 里带业务码：会话失效的文案要按凭证错误上抛（宿主才会禁用
+		// 这个号），其它码是「本次没领成」而不是网络故障——当成 transient 会
+		// 无限重试。
+		if core.ContainsAny(strings.ToLower(envelope.Msg), deadMarkers) {
+			return nil, Classify(http.StatusUnauthorized, *envelope.Code, envelope.Msg)
+		}
 		return &CheckinResult{
 			Already: envelope.Data.AlreadyCompleted,
 			Msg:     core.FirstNonEmpty(envelope.Msg, "签到未完成"),
@@ -137,13 +144,124 @@ func reportLoginActive(ctx context.Context, baseURL string, cred *Credential) er
 	ApplyUserAPIHeaders(req, cred.AccessTokenValue())
 	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
-		return errDo
+		// 传输层失败归 transient：宿主换号重试是安全的。
+		return &core.Failure{Kind: core.FailureKindTransient, Msg: "login-active: " + errDo.Error()}
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// 排空响应体再关：宿主桥靠它复用连接。回执内容无关紧要，只看状态码。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	// 读回执：失败时上游把原因写在正文里（会话失效、账号被限），丢掉就只能
+	// 报一个裸状态码。回执内容对成功路径无关紧要。
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("login-active rejected: HTTP %d", resp.StatusCode)
+		// 走统一分类：401/403 归会话失效、402 归余额、429 归限流，
+		// 而不是一律 transient 让宿主反复换号重试。
+		return Classify(resp.StatusCode, 0, string(raw))
 	}
 	return nil
+}
+
+// ---- 一键任务 ----
+//
+// 上游能自动完成的运营动作只有两条：签到（autoclaw-task-complete）与登录
+// 活跃上报（user-info）。活动奖励由服务端按这两条事件发放，没有别的领取
+// 入口，因此一键任务就按下面这张表逐行执行，表外的动作一律不做。
+
+// AutoTaskCodeLoginActive 是一键任务里「登录活跃」那一行的任务码。
+const AutoTaskCodeLoginActive = "(登录活跃)"
+
+// autoTask 是一键任务表的一行。
+type autoTask struct {
+	code  string
+	label string
+	// skip 返回非空原因时本行不执行（→ skipped，原因即此）。
+	skip func(*autoRun) string
+	// exec 执行本行；返回空消息表示无事可做（→ skipped）。
+	exec func(context.Context, *autoRun) (string, int64, error)
+}
+
+// autoRun 是一轮一键任务的共享状态。
+type autoRun struct {
+	baseURL string
+	cred    *Credential
+	// loginActiveReported 报告签到流程是否已经代劳了登录活跃上报。
+	// 重复上报没有额外收益，能省一次就省一次。
+	loginActiveReported bool
+}
+
+// autoTasks 是一键任务表（顺序即依赖序）。
+var autoTasks = []autoTask{
+	{
+		code:  AutoTaskCodeLoginActive,
+		label: "登录活跃",
+		skip: func(run *autoRun) string {
+			if strings.TrimSpace(run.cred.DeviceIDValue()) == "" {
+				return "凭证缺少 device_id，无法上报登录活跃"
+			}
+			if run.loginActiveReported {
+				return "签到流程已上报登录活跃，本次不重复上报"
+			}
+			return ""
+		},
+		exec: func(ctx context.Context, run *autoRun) (string, int64, error) {
+			if errActive := reportLoginActive(ctx, run.baseURL, run.cred); errActive != nil {
+				return "", 0, errActive
+			}
+			return "已上报登录活跃（服务端据此发放每日活跃奖励）", 0, nil
+		},
+	},
+}
+
+// runAutoTasks 按表执行，把每一行折成 core 的三态结果。
+func runAutoTasks(ctx context.Context, tasks []autoTask, run *autoRun) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, len(tasks))
+	for _, task := range tasks {
+		results = append(results, task.run(ctx, run))
+	}
+	return results
+}
+
+// run 执行一行任务：前置不成立即 skipped，执行失败即 error，空消息即 skipped。
+func (t autoTask) run(ctx context.Context, run *autoRun) core.AutoTaskResult {
+	result := core.AutoTaskResult{Code: t.code}
+	if t.skip != nil {
+		if reason := t.skip(run); reason != "" {
+			result.Status = core.AutoStatusSkipped
+			result.Message = reason
+			return result
+		}
+	}
+	message, credit, errExec := t.exec(ctx, run)
+	result.Credit = credit
+	switch {
+	case errExec != nil:
+		result.Status = core.AutoStatusError
+		result.Message = t.label + "：" + reasonOf(errExec)
+	case strings.TrimSpace(message) == "":
+		result.Status = core.AutoStatusSkipped
+		result.Message = "当前无需动作"
+	default:
+		result.Status = core.AutoStatusDone
+		result.Message = message
+	}
+	return result
+}
+
+// autoTaskFor 按任务码查表。
+func autoTaskFor(code string) (autoTask, bool) {
+	trimmed := strings.TrimSpace(code)
+	for _, task := range autoTasks {
+		if task.code == trimmed {
+			return task, true
+		}
+	}
+	return autoTask{}, false
+}
+
+// reasonOf 取用户可读的失败原因：分类错误用上游原文，避免把
+// "upstream soft_rate [429]:" 这类内部分类前缀怼到页面上。
+func reasonOf(err error) string {
+	var failure *core.Failure
+	if errors.As(err, &failure) && strings.TrimSpace(failure.Msg) != "" {
+		return failure.Msg
+	}
+	return err.Error()
 }

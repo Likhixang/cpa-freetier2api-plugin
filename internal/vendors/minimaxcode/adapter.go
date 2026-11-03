@@ -208,6 +208,53 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 
 func (v *adapter) SupportsCheckin() bool { return v.region == RegionGlobal }
 
+// SupportsCheckinFor 实现 core.CheckinCapability：按账号判定签到。
+//
+// 供应商级判定已经按区域做了，这里再显式实现一次是为了让控制台能拿到
+// 「为什么不能签到」的原因（core.CheckinUnsupportedReason），而不是显示
+// 一个必然失败的按钮。
+func (v *adapter) SupportsCheckinFor(_ *core.Credential) bool { return v.SupportsCheckin() }
+
+// CheckinUnsupportedReason 实现 core.CheckinCapability：返回不可签到的原因。
+func (v *adapter) CheckinUnsupportedReason(_ *core.Credential) string {
+	if v.SupportsCheckin() {
+		return ""
+	}
+	return "国内版上游未提供签到/活动接口（每日礼包仅国际版可用）"
+}
+
+// ---- 一键任务 ----
+
+// RunAllTasks 执行一键任务。
+//
+// 上游只有签到一条运营接口（signin/status + signin/claim），其余端点都是
+// 额度查询（membership / coding_plan / credit_details），没有任务中心或成长
+// 任务体系，因此一键任务就是「每日礼包」这一行。能签的账号执行签到；国内版
+// 账号如实报 skipped 并说明原因——既不谎报「已完成」，也不报成故障。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	if row := core.BuildCheckinAutoTask(ctx, v, cred); row != nil {
+		return []core.AutoTaskResult{*row}
+	}
+	return []core.AutoTaskResult{{
+		Code:    core.AutoTaskCodeCheckin,
+		Status:  core.AutoStatusSkipped,
+		Message: core.FirstNonEmpty(core.CheckinUnsupportedReason(v, cred), "该账号没有可自动完成的签到/活动"),
+	}}
+}
+
+// RunTask 执行单条任务；未知任务码如实跳过。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != core.AutoTaskCodeCheckin {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	rows := v.RunAllTasks(ctx, cred)
+	if len(rows) == 0 {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该账号不支持签到"}, nil
+	}
+	row := rows[0]
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
 // ConfigFields 声明 MiniMax Code 专属配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
@@ -225,4 +272,6 @@ var (
 	_ core.LoginProvider        = (*adapter)(nil)
 	_ core.QuotaProvider        = (*adapter)(nil)
 	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.CheckinCapability    = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

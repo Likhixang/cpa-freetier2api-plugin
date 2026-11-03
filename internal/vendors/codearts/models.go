@@ -63,7 +63,12 @@ func FetchBenefitModels(ctx context.Context, cred *Credential) ([]Model, error) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务/解析错误，
+		// 模型清单于是静默变空（等于该账号没有免费模型）。
+		return nil, &core.Failure{Kind: core.FailureKindTransient, Msg: "read benefit models response: " + errRead.Error()}
+	}
 	if resp.StatusCode >= 400 {
 		return nil, Classify(resp.StatusCode, string(body))
 	}
@@ -72,7 +77,9 @@ func FetchBenefitModels(ctx context.Context, cred *Credential) ([]Model, error) 
 		return nil, fmt.Errorf("decode benefit gateway config: %w", err)
 	}
 	if envelope.ErrorCode != "" && envelope.ErrorCode != "0000" {
-		return nil, fmt.Errorf("benefit gateway %s: %s", envelope.ErrorCode, envelope.ErrorMsg)
+		// 200 包体里的业务码：走福利码分类（凭证过期 / 权益不存在 / 名额用完），
+		// 否则「STS 过期」会被当成一句普通的解析失败。
+		return nil, benefitFailure(0, envelope.ErrorCode, envelope.ErrorMsg)
 	}
 	var config struct {
 		Models []struct {

@@ -3,6 +3,7 @@ package qoder
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -220,6 +221,106 @@ func TestCheckinHeadersOmitMachineWhenUnavailable(t *testing.T) {
 	}
 	if headers["cosy-version"] == "" {
 		t.Error("cosy-version 不应为空")
+	}
+}
+
+// TestSelectRuntimeInfo 是「本机客户端探测」的表驱动测试。
+//
+// 探测本身是纯函数：候选路径与存在性都由调用方注入，所以装了客户端、没装、
+// 覆盖指向不存在的文件这三种情况都能在这里锁住，不必依赖开发机装没装 Qoder。
+func TestSelectRuntimeInfo(t *testing.T) {
+	existing := map[string]bool{
+		"/home/u/.qoder/.bin/umid-new/runtime-info": true,
+		"/home/u/.qoder/.bin/umid-old/runtime-info": true,
+		"/opt/qoder/runtime-info":                   true,
+	}
+	exists := func(path string) bool { return existing[path] }
+	cases := []struct {
+		name      string
+		probe     runtimeInfoProbe
+		want      string
+		wantFound bool
+	}{
+		{
+			name: "按优先级取第一个存在的候选",
+			probe: runtimeInfoProbe{Candidates: []string{
+				"/home/u/.qoder/.bin/umid-new/runtime-info",
+				"/home/u/.qoder/.bin/umid-old/runtime-info",
+			}},
+			want:      "/home/u/.qoder/.bin/umid-new/runtime-info",
+			wantFound: true,
+		},
+		{
+			name: "跳过不存在的候选",
+			probe: runtimeInfoProbe{Candidates: []string{
+				"/home/u/.qoder/.bin/umid-gone/runtime-info",
+				"/home/u/.qoder/.bin/umid-old/runtime-info",
+			}},
+			want:      "/home/u/.qoder/.bin/umid-old/runtime-info",
+			wantFound: true,
+		},
+		{
+			name:      "没装客户端时找不到",
+			probe:     runtimeInfoProbe{Candidates: []string{"/home/u/.qoder/.bin/umid-gone/runtime-info"}},
+			wantFound: false,
+		},
+		{
+			name:      "候选为空（客户端目录不存在）时找不到",
+			probe:     runtimeInfoProbe{},
+			wantFound: false,
+		},
+		{
+			name:      "空串候选被跳过",
+			probe:     runtimeInfoProbe{Candidates: []string{"", "  "}},
+			wantFound: false,
+		},
+		{
+			name:      "显式覆盖优先于候选",
+			probe:     runtimeInfoProbe{Override: "/opt/qoder/runtime-info", Candidates: []string{"/home/u/.qoder/.bin/umid-new/runtime-info"}},
+			want:      "/opt/qoder/runtime-info",
+			wantFound: true,
+		},
+		{
+			name:      "覆盖指向不存在的文件时不回落到候选",
+			probe:     runtimeInfoProbe{Override: "/opt/missing/runtime-info", Candidates: []string{"/home/u/.qoder/.bin/umid-new/runtime-info"}},
+			wantFound: false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, found := selectRuntimeInfo(testCase.probe, exists)
+			if found != testCase.wantFound || got != testCase.want {
+				t.Fatalf("selectRuntimeInfo = %q/%v, want %q/%v", got, found, testCase.want, testCase.wantFound)
+			}
+		})
+	}
+}
+
+// TestLocateRuntimeInfoHonorsOverride 锁住环境变量覆盖的接线：
+// 覆盖指向真实文件时直接返回它，指不到时不回落到客户端目录。
+func TestLocateRuntimeInfoHonorsOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-info")
+	if errWrite := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o700); errWrite != nil {
+		t.Fatalf("write fixture: %v", errWrite)
+	}
+	t.Setenv("QODER_RUNTIME_INFO", path)
+	if got, ok := locateRuntimeInfo(RegionGlobal); !ok || got != path {
+		t.Fatalf("locateRuntimeInfo = %q/%v, want %q/true", got, ok, path)
+	}
+	t.Setenv("QODER_RUNTIME_INFO", filepath.Join(t.TempDir(), "missing"))
+	if _, ok := locateRuntimeInfo(RegionGlobal); ok {
+		t.Fatal("覆盖指向不存在的文件时不得回落到候选路径")
+	}
+}
+
+// TestMachineIdentityHintNamesFields 锁住手工兜底文案的两个要素：
+// 在哪运行官方组件、把值填到哪个字段。缺任一条，用户就只能猜。
+func TestMachineIdentityHintNamesFields(t *testing.T) {
+	hint := MachineIdentityHint(RegionGlobal)
+	for _, want := range []string{"runtime-info", "--account-stdin", "machine_token", "machine_type"} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("提示文案缺少 %q：%s", want, hint)
+		}
 	}
 }
 

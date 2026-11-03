@@ -2,6 +2,8 @@ package zcode
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -256,6 +258,169 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return fields
 }
 
+// ---- 一键任务 ----
+
+// 一键任务里代表各自动作的任务码。
+const (
+	// AutoTaskCodeActivity 是「活动资格」：上报 app_launch / app_daily_active。
+	AutoTaskCodeActivity = "(活动资格)"
+	// AutoTaskCodePlanClaim 是「套餐领取」：列出可领套餐，但领取需要人机验证。
+	AutoTaskCodePlanClaim = "(套餐领取)"
+)
+
+// autoTask 是一键任务表的一行。
+type autoTask struct {
+	code  string
+	label string
+	// skip 返回非空原因时本行不执行（→ skipped，原因即此）。
+	skip func(*autoRun) string
+	// exec 执行本行；outcome.message 为空表示无事可做（原因见 reason）。
+	exec func(context.Context, *autoRun) (autoOutcome, error)
+}
+
+// autoOutcome 是一行任务的产出。
+type autoOutcome struct {
+	message string
+	reason  string
+	credit  int64
+	energy  int64
+}
+
+// autoRun 是一轮一键任务的共享上下文。
+type autoRun struct {
+	vendor *adapter
+	cred   *Credential
+}
+
+// autoTasks 是一键任务表（顺序即依赖序：先报资格，再看投放）。
+//
+// ZCode 的活动套餐领取必须带人机验证令牌（core.PlanClaimRequest.VerifyParam
+// 由控制台的验证码组件产出），代理侧没有可替代的求解手段，所以「套餐领取」
+// 这一行只做能自动完成的那一半：列出当前可领数量，并如实跳过。
+var autoTasks = []autoTask{
+	{
+		code:  AutoTaskCodeActivity,
+		label: "活动资格",
+		skip: func(run *autoRun) string {
+			if run.cred == nil {
+				return "凭证缺失"
+			}
+			return ""
+		},
+		exec: func(ctx context.Context, run *autoRun) (autoOutcome, error) {
+			probe, errProbe := run.vendor.probeActivity(ctx, run.cred)
+			if errProbe != nil {
+				return autoOutcome{}, errProbe
+			}
+			message := "已上报活动资格事件（app_launch / app_daily_active）"
+			if probe.Warning != "" {
+				message += "（" + probe.Warning + "）"
+			}
+			return autoOutcome{message: message}, nil
+		},
+	},
+	{
+		code:  AutoTaskCodePlanClaim,
+		label: "套餐领取",
+		skip: func(run *autoRun) string {
+			return billingBlockReason(run.cred)
+		},
+		exec: func(ctx context.Context, run *autoRun) (autoOutcome, error) {
+			plans, errPreview := run.vendor.previewPlans(ctx, run.cred)
+			if errPreview != nil {
+				return autoOutcome{}, errPreview
+			}
+			if len(plans) == 0 {
+				return autoOutcome{reason: "当前没有可领的套餐（已领完或活动未投放）"}, nil
+			}
+			return autoOutcome{
+				reason: "当前 " + strconv.Itoa(len(plans)) + " 个套餐可领，领取需在控制台输入人机验证码",
+			}, nil
+		},
+	},
+}
+
+// runAutoTasks 按表执行，把每一行折成 core 的三态结果。
+func runAutoTasks(ctx context.Context, tasks []autoTask, run *autoRun) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, len(tasks))
+	for _, task := range tasks {
+		results = append(results, task.run(ctx, run))
+	}
+	return results
+}
+
+// run 执行一行任务：前置不成立即 skipped，执行失败即 error，无产出即 skipped。
+func (t autoTask) run(ctx context.Context, run *autoRun) core.AutoTaskResult {
+	result := core.AutoTaskResult{Code: t.code}
+	if t.skip != nil {
+		if reason := t.skip(run); reason != "" {
+			result.Status = core.AutoStatusSkipped
+			result.Message = reason
+			return result
+		}
+	}
+	outcome, errExec := t.exec(ctx, run)
+	result.Credit, result.Energy = outcome.credit, outcome.energy
+	switch {
+	case errExec != nil:
+		result.Status = core.AutoStatusError
+		result.Message = t.label + "：" + failureReason(errExec)
+	case strings.TrimSpace(outcome.message) == "":
+		result.Status = core.AutoStatusSkipped
+		result.Message = core.FirstNonEmpty(outcome.reason, "当前无需动作")
+	default:
+		result.Status = core.AutoStatusDone
+		result.Message = outcome.message
+	}
+	return result
+}
+
+// autoTaskFor 按任务码查表。
+func autoTaskFor(code string) (autoTask, bool) {
+	trimmed := strings.TrimSpace(code)
+	for _, task := range autoTasks {
+		if task.code == trimmed {
+			return task, true
+		}
+	}
+	return autoTask{}, false
+}
+
+// failureReason 取用户可读的失败原因：分类错误优先用上游原文，避免把
+// "upstream waf_block [403]:" 这类内部分类前缀怼到页面上。
+func failureReason(err error) string {
+	var failure *core.Failure
+	if errors.As(err, &failure) && strings.TrimSpace(failure.Msg) != "" {
+		return failure.Msg
+	}
+	return err.Error()
+}
+
+// RunAllTasks 执行一键任务。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return []core.AutoTaskResult{{
+			Code: AutoTaskCodeActivity, Status: core.AutoStatusError, Message: "账号：" + errNative.Error(),
+		}}
+	}
+	return runAutoTasks(ctx, autoTasks, &autoRun{vendor: v, cred: native})
+}
+
+// RunTask 执行单条任务；未知任务码如实跳过。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	task, okTask := autoTaskFor(code)
+	if !okTask {
+		return core.TaskRunResult{Status: core.AutoStatusSkipped, Message: "该供应商没有这条任务"}, nil
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.TaskRunResult{}, errNative
+	}
+	row := task.run(ctx, &autoRun{vendor: v, cred: native})
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
@@ -268,4 +433,5 @@ var (
 	_ core.ActivityProbe        = (*adapter)(nil)
 	_ core.PlanClaimer          = (*adapter)(nil)
 	_ core.LegacyIDReporter     = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
 )

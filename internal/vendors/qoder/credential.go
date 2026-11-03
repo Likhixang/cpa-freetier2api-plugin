@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -353,18 +354,59 @@ func readRuntimeInfoIdentity(region Region) (MachineIdentity, bool) {
 
 // locateRuntimeInfo 定位本机 runtime-info 可执行文件。
 //
-// 路径形态：<home>/<dataDir>/.bin/umid-<hash>/runtime-info(.exe)。
-// 目录名带哈希（随版本变化），因此枚举而不是写死。
+// 输入是「显式覆盖 + 客户端目录里的候选」，挑选逻辑在 selectRuntimeInfo 里，
+// 这里只负责把环境变量与文件系统读成纯数据。
 func locateRuntimeInfo(region Region) (string, bool) {
-	if override := strings.TrimSpace(os.Getenv("QODER_RUNTIME_INFO")); override != "" {
-		if fileExists(override) {
+	return selectRuntimeInfo(runtimeInfoProbe{
+		Override:   os.Getenv("QODER_RUNTIME_INFO"),
+		Candidates: runtimeInfoCandidates(region),
+	}, fileExists)
+}
+
+// runtimeInfoProbe 是一次本机组件探测的输入。
+//
+// 抽成纯数据 + 纯函数是为了可测：装了客户端 / 没装 / 覆盖指向不存在的文件
+// 三种情况都能用表驱动测住，不必在 CI 机器上真装一个 Qoder。
+type runtimeInfoProbe struct {
+	// Override 是 QODER_RUNTIME_INFO 显式指定的可执行文件。
+	Override string
+	// Candidates 是按优先级排列的候选路径。
+	Candidates []string
+}
+
+// selectRuntimeInfo 从显式覆盖与候选路径里挑出可执行文件。
+//
+// 纯函数：不读环境变量、不碰文件系统，存在性由 exists 注入。
+// 显式覆盖只认它自己：指向不存在的文件时直接判失败，不回落到候选路径——
+// 用户写覆盖就是要指定那一个，静默换掉会让「为什么还是拿不到身份」无从排查。
+func selectRuntimeInfo(probe runtimeInfoProbe, exists func(string) bool) (string, bool) {
+	if override := strings.TrimSpace(probe.Override); override != "" {
+		if exists(override) {
 			return override, true
 		}
 		return "", false
 	}
+	for _, candidate := range probe.Candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+		if exists(trimmed) {
+			return trimmed, true
+		}
+	}
+	return "", false
+}
+
+// runtimeInfoCandidates 列出本机客户端的 runtime-info 候选路径。
+//
+// 路径形态：<home>/<dataDir>/.bin/umid-<hash>/runtime-info(.exe)。
+// 目录名带哈希（随客户端版本变化），因此枚举 .bin 下所有 umid-* 目录，
+// 并按目录修改时间从新到旧排：客户端升级后会留下旧目录，先试最新的那个。
+func runtimeInfoCandidates(region Region) []string {
 	home, errHome := os.UserHomeDir()
 	if errHome != nil {
-		return "", false
+		return nil
 	}
 	name := "runtime-info"
 	if runtime.GOOS == "windows" {
@@ -373,18 +415,46 @@ func locateRuntimeInfo(region Region) (string, bool) {
 	binDir := filepath.Join(home, clientFor(region).dataDir, ".bin")
 	entries, errRead := os.ReadDir(binDir)
 	if errRead != nil {
-		return "", false
+		return nil
 	}
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	found := make([]candidate, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "umid-") {
 			continue
 		}
-		candidate := filepath.Join(binDir, entry.Name(), name)
-		if fileExists(candidate) {
-			return candidate, true
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			continue
 		}
+		found = append(found, candidate{
+			path:    filepath.Join(binDir, entry.Name(), name),
+			modTime: info.ModTime(),
+		})
 	}
-	return "", false
+	sort.Slice(found, func(i, j int) bool { return found[i].modTime.After(found[j].modTime) })
+	paths := make([]string, 0, len(found))
+	for _, item := range found {
+		paths = append(paths, item.path)
+	}
+	return paths
+}
+
+// MachineIdentityHint 说明设备身份的手工获取办法。
+//
+// 上游按 machineToken 精确校验，插件不能派生（见 identity 注释），所以没装
+// 官方客户端时唯一出路是手工填。文案必须同时说清「在哪拿」与「填到哪个
+// 字段」，否则用户只能猜——这也是「国际版看不到活动」最常见的成因。
+func MachineIdentityHint(region Region) string {
+	client := clientFor(region)
+	return fmt.Sprintf("本机没有找到 Qoder 官方客户端的 runtime-info 组件（%s 下的 .bin/umid-*/runtime-info）。"+
+		"请在一台登录过 Qoder 客户端的机器上运行它：runtime-info %s --account-stdin，"+
+		"把输出里的 machineToken 与 machineType 成对填进凭证文件的 machine_token / machine_type 字段"+
+		"（或插件配置 qoder_machine_token / qoder_machine_type）",
+		filepath.Join("<home>", client.dataDir), runtimeInfoEnvironment(region))
 }
 
 // parseRuntimeInfoOutput 从 runtime-info 的 JSON 输出里取出身份。

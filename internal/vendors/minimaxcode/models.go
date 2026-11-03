@@ -235,6 +235,20 @@ func fetchWorkspaceModels(ctx context.Context, cred *Credential, baseURLOverride
 		return nil, core.NewPluginError("minimax_config_unavailable",
 			"config endpoint returned "+resp.Status, resp.StatusCode)
 	}
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, &core.Failure{Status: resp.StatusCode, Kind: core.FailureKindTransient,
+			Msg: "read config response: " + errRead.Error()}
+	}
+	// 上游把业务失败也塞进 200：只看状态码会把「凭证过期 / 限流」当成
+	// 「这个账号没有模型」，模型清单静默变空。先认信封再解析。
+	var envelope map[string]any
+	if errDecode := json.Unmarshal(raw, &envelope); errDecode == nil {
+		if errBusiness := signinBusinessError(envelope); errBusiness != nil {
+			return nil, errBusiness
+		}
+	}
 	var body struct {
 		Models []struct {
 			ModelID           string   `json:"model_id"`
@@ -243,7 +257,7 @@ func fetchWorkspaceModels(ctx context.Context, cred *Credential, baseURLOverride
 			SupportedVariants []string `json:"supported_variants"`
 		} `json:"models"`
 	}
-	if errDecode := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); errDecode != nil {
+	if errDecode := json.Unmarshal(raw, &body); errDecode != nil {
 		return nil, errDecode
 	}
 	models := make([]workspaceModel, 0, len(body.Models))

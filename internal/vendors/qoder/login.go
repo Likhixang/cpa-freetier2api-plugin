@@ -205,7 +205,11 @@ func FetchPlanName(ctx context.Context, token string, region Region) string {
 // BuildLoginStorage 生成落盘用的凭证 JSON（扁平格式）。
 //
 // 与导入路径同构：刷新时代码（auth.refresh）能原样读回这些字段。
-func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string) ([]byte, *Credential) {
+//
+// identity 是登录这台机器上官方组件签发的设备身份：国际版活动按它精确校验，
+// 登录时能拿到就一并写进凭证，用户不必再手工抄一遍。拿不到时留空——宁可让
+// 用户看到「缺设备身份」的提示，也不写一个派生值把可领活动过滤掉。
+func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string, identity MachineIdentity) ([]byte, *Credential) {
 	payload := map[string]any{
 		"device_token": token,
 		"region":       string(region),
@@ -227,6 +231,13 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 	if plan != "" {
 		payload["plan"] = plan
 	}
+	if identity.Native() {
+		payload["machine_token"] = identity.Token
+		payload["machine_type"] = identity.Type
+		if identity.Code != "" {
+			payload["machine_code"] = identity.Code
+		}
+	}
 	if profile.UserID != "" {
 		payload["qoder_account_id"] = profile.UserID
 	}
@@ -244,6 +255,9 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 		Region:       region,
 		Label:        label,
 		Email:        profile.Email,
+		MachineToken: identity.Token,
+		MachineType:  identity.Type,
+		MachineCode:  identity.Code,
 	}
 }
 
@@ -345,6 +359,11 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		Region:       cred.Region,
 		Label:        cred.Label,
 		Email:        cred.Email,
+		// 设备身份必须跟着续期走：它是账号能看见国际版活动的前提，续期时
+		// 丢掉等于每刷新一次就把活动权限清零。
+		MachineToken: cred.MachineToken,
+		MachineType:  cred.MachineType,
+		MachineCode:  cred.MachineCode,
 	}
 	return updated, true, nil
 }

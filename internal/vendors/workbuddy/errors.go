@@ -125,6 +125,11 @@ func Classify(status int, body string) *core.Failure {
 	if core.ContainsAny(lower, sessionDeadMarkers) {
 		return &core.Failure{Kind: core.FailureKindSessionDead, Status: status, Msg: body}
 	}
+	// 2.1) 裸 401：上游有时只回状态码，不带业务码也不带文案。按 client 处理
+	// 会让宿主把这个已经失效的号继续留在池子里，每次选中都失败一次。
+	if status == http.StatusUnauthorized {
+		return &core.Failure{Kind: core.FailureKindSessionDead, Status: status, Msg: body}
+	}
 	// 3) 账号级故障（注意：不能按 11140 判定——该 code 也承载模型级限流文案）。
 	if core.ContainsAny(lower, accountFaultMarkers) {
 		return &core.Failure{Kind: core.FailureKindAccountFault, Status: status, Msg: body}
