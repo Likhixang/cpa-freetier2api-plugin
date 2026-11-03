@@ -1028,3 +1028,41 @@ func TestJWTIdentityExtractsAccountID(t *testing.T) {
 		t.Errorf("非 JWT 应返回空，得到 %q", got)
 	}
 }
+
+// Trae 读流原先单行上限 4 MiB，统一后与其它供应商一样是 8 MiB：一行约 5 MiB 的
+// 输出帧照常解析，不再以 bufio.ErrTooLong 中断。
+func TestChatStreamAcceptsMultiMegabyteFrame(t *testing.T) {
+	stubHost(t)
+	big := strings.Repeat("长", 5*1024*1024/3)
+	fixture := "id: 1\nevent: output\ndata: {\"response\":\"" + big + "\",\"reasoning_content\":null,\"tool_calls\":null}\n\n" +
+		"id: 2\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpModels:
+			_, _ = w.Write([]byte(catalogFixture))
+		case EpChat:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(fixture))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+
+	var joined strings.Builder
+	errStream := ChatStream(context.Background(), "", ChatRequest{
+		Credential: testCredential(),
+		Profile:    cfg,
+		Body:       []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`),
+	}, func(chunk []byte) error {
+		joined.Write(chunk)
+		return nil
+	})
+	if errStream != nil {
+		t.Fatalf("5 MiB frame must stream, got %v", errStream)
+	}
+	if !strings.Contains(joined.String(), big) {
+		t.Fatalf("big frame content missing from stream output (len=%d)", joined.Len())
+	}
+}

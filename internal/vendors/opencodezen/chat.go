@@ -1,7 +1,6 @@
 package opencodezen
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -397,10 +396,9 @@ type sseDeltaChunk struct {
 
 // CollapseSSEToJSON 将上游 SSE 流消费并组装成一个完整的 OpenAI 格式 chat.completion JSON 响应。
 func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames) ([]byte, error) {
-	scanner := bufio.NewScanner(r)
 	// 单帧上限：默认 64KB 会被长工具参数/长思考块撑爆，撑爆后 Scan 返回 false
 	// 且 Err() 是 ErrTooLong，整段回答会被静默截断。
-	scanner.Buffer(make([]byte, 0, 64*1024), hostbridge.SSEScannerBuffer)
+	scanner := hostbridge.NewSSEScanner(r)
 	resp := chatCompletionResponse{
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),

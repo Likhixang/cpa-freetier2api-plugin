@@ -1,7 +1,6 @@
 package qoder
 
 import (
-	"bufio"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -958,10 +957,9 @@ func readQoderStream(ctx context.Context, body io.Reader, onLine func(string) bo
 				errCh <- safe.NewPanicError("qoder stream reader", r)
 			}
 		}()
-		scanner := bufio.NewScanner(body)
 		// 单行上限与其它供应商统一（8 MiB）：大的工具调用参数可能整段落在一行里，
 		// 超限会报 bufio.ErrTooLong 并中断整条流。
-		scanner.Buffer(make([]byte, 0, 64*1024), hostbridge.SSEScannerBuffer)
+		scanner := hostbridge.NewSSEScanner(body)
 		for scanner.Scan() {
 			select {
 			case lineCh <- scanner.Text():

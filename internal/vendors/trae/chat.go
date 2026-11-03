@@ -10,7 +10,6 @@ package trae
 //     国际版无签到活动，额度走独立的 v1 端点（见 tasks.go 的 Config.QuotaPath）。
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -331,8 +330,7 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		finish      = "stop"
 	)
 
-	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner := hostbridge.NewSSEScanner(respBody)
 	var currentEvent string
 
 	for scanner.Scan() {
@@ -408,8 +406,7 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk St
 	}
 	defer func() { _ = respBody.Close() }()
 
-	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner := hostbridge.NewSSEScanner(respBody)
 	var currentEvent string
 	chunkID := "chatcmpl-" + core.RandomHex(6)
 	created := time.Now().Unix()

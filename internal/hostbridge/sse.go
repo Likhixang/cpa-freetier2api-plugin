@@ -15,6 +15,18 @@ import (
 // SSEScannerBuffer 是单帧的上限（默认 64KB 会截断工具参数这类长帧）。
 const SSEScannerBuffer = 8 * 1024 * 1024
 
+// sseScannerInitialBuffer 是读流 Scanner 的初始缓冲，长行时按需增长到 SSEScannerBuffer。
+const sseScannerInitialBuffer = 64 * 1024
+
+// NewSSEScanner 返回按行读取上游流式响应的 Scanner：初始缓冲 64 KiB，单行上限
+// SSEScannerBuffer。各供应商读流统一用它创建，避免各自的上限不一致（超限会
+// 报 bufio.ErrTooLong 并中断整条流）。
+func NewSSEScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, sseScannerInitialBuffer), SSEScannerBuffer)
+	return scanner
+}
+
 // ForwardRawSSE 逐帧转发上游 SSE 载荷。
 //
 // 行为约定（与宿主契约对齐）：
@@ -29,8 +41,7 @@ func ForwardRawSSE(body io.Reader, emit func([]byte) error) error {
 	if body == nil {
 		return nil
 	}
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), SSEScannerBuffer)
+	scanner := NewSSEScanner(body)
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), "\r")

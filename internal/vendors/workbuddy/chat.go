@@ -1,7 +1,6 @@
 package workbuddy
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -974,9 +973,8 @@ func Stream(body io.Reader, opts StreamOptions) (StreamStats, error) {
 		return stats, errEmptyStream
 	}
 
-	scanner := bufio.NewScanner(body)
 	// 上游的单帧可能很长（工具参数、长文本），默认 64KB 会截断。
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner := hostbridge.NewSSEScanner(body)
 
 	firstID := ""
 	seenToolName := map[int]bool{}
@@ -1235,8 +1233,7 @@ func Aggregate(body io.Reader) ([]byte, error) {
 	if body == nil {
 		return nil, errEmptyStream
 	}
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner := hostbridge.NewSSEScanner(body)
 
 	var (
 		id           string

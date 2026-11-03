@@ -1,7 +1,6 @@
 package zcode
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	_ "embed"
@@ -909,9 +908,8 @@ func (c *streamConverter) chunkWithUsage(delta map[string]any, finishReason *str
 
 // parseAnthropicSSE 逐行解析上游 SSE 并交给转换器。
 func parseAnthropicSSE(r io.Reader, converter *streamConverter, onChunk func([]byte) error) error {
-	scanner := bufio.NewScanner(r)
 	// 单条事件可能很大（大段 text_delta / base64 图片），放宽到 8MB。
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner := hostbridge.NewSSEScanner(r)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())

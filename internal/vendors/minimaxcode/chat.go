@@ -1,7 +1,6 @@
 package minimaxcode
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -235,8 +234,7 @@ func chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 
 	agg := &frameAggregator{}
 
-	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner := hostbridge.NewSSEScanner(respBody)
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), "\r")
@@ -371,8 +369,7 @@ func chatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 		return emitDelta(map[string]any{"content": text})
 	}
 
-	scanner := bufio.NewScanner(respBody)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner := hostbridge.NewSSEScanner(respBody)
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), "\r")
