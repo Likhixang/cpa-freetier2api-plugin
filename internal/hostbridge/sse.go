@@ -94,7 +94,12 @@ func ForwardRawSSE(body io.Reader, emit func([]byte) error) error {
 // 任一出现都算结束。误判的代价只是不冷却凭证（比冷却一个好账号轻），
 // 漏判的代价是把正常收尾的流当成截断 —— 所以宁可放宽。
 func isTerminalSSEPayload(payload string) bool {
-	for _, marker := range []string{`"finish_reason"`, `"finishReason"`, `"stop_reason"`, `message_stop`} {
+	for _, marker := range []string{
+		`"finish_reason"`, `"finishReason"`, `"stop_reason"`, `message_stop`,
+		// 业务错误帧：上游用一帧错误结束整轮（HTTP 200 + error_code/error 对象），
+		// 这类流已经正常收尾，不能再追加「断流」错误帧。
+		`"error_code"`, `"errorCode"`, `"error":`,
+	} {
 		if strings.Contains(payload, marker) {
 			return true
 		}

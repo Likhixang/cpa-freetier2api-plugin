@@ -85,8 +85,13 @@ func TestToPluginErrorRestoresBridgeStatus(t *testing.T) {
 	if !pluginErr.Retryable {
 		t.Fatal("429 应标记为可重试")
 	}
-	if pluginErr.Code != "upstream_soft_rate" {
-		t.Fatalf("Code = %q, want upstream_soft_rate", pluginErr.Code)
+	// 429 是模型级容量限流：用宿主认得的 transient_rate_limit，宿主只冷却当前
+	// 模型，不走额度耗尽路径。
+	if pluginErr.Code != codeTransientRateLimit {
+		t.Fatalf("Code = %q, want %s", pluginErr.Code, codeTransientRateLimit)
+	}
+	if pluginErr.IsCredentialScoped() {
+		t.Fatal("429 容量限流不该标记为凭证级")
 	}
 	if !strings.Contains(pluginErr.Message, "上游 HTTP 429") {
 		t.Fatalf("消息未还原成可读形态：%q", pluginErr.Message)
@@ -139,6 +144,28 @@ func TestPluginErrorMessageKeepsUpstreamDetail(t *testing.T) {
 	}
 	if pluginErr.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("HTTPStatus = %d, want 403", pluginErr.HTTPStatus)
+	}
+}
+
+// TestToPluginErrorMarksCredentialScopedQuota 确认账号级额度耗尽（402）会被标成
+// credential_quota + credential_scoped：宿主据此把冷却同步到该凭证的全部模型。
+func TestToPluginErrorMarksCredentialScopedQuota(t *testing.T) {
+	raw := errors.New(`host.http.do: host_call_failed: execute host http request: ` +
+		`Post "https://www.workbuddy.cn/v2/chat/completions": Payment Required`)
+
+	pluginErr, okPlugin := ToPluginError(raw).(*PluginError)
+	if !okPlugin {
+		t.Fatal("应翻译成 *PluginError")
+	}
+	if pluginErr.Code != codeCredentialQuota {
+		t.Fatalf("Code = %q, want %s", pluginErr.Code, codeCredentialQuota)
+	}
+	if !pluginErr.IsCredentialScoped() {
+		t.Fatal("账号级额度耗尽必须标记为凭证级")
+	}
+	envelope := string(ErrorEnvelopeFromError(pluginErr))
+	if !strings.Contains(envelope, `"credential_scoped":true`) {
+		t.Fatalf("信封未携带 credential_scoped：%s", envelope)
 	}
 }
 
