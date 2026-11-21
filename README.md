@@ -73,7 +73,7 @@ plugins:
 
 ### 方式三：源码编译
 
-需 Go 1.22+ 与 C 编译器（启用 `CGO_ENABLED=1`），或直接使用内置构建脚本：
+需 Go 1.24+ 与 C 编译器（启用 `CGO_ENABLED=1`），或直接使用内置构建脚本：
 
 ```bash
 git clone https://github.com/Likhixang/cpa-freetier2api-plugin.git

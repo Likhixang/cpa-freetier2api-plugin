@@ -461,7 +461,7 @@ type Endpoints struct {
 	AcceptLanguage string
 	// PlatformLabel 是 UA 中的平台段（CN 为 WorkBuddy，Global 为 workbuddy-ai）。
 	PlatformLabel string
-	// ClientVersion 是官方客户端版本（CN 为 5.8.3，Global 为 5.8.4）。
+	// ClientVersion 是官方客户端版本（CN 为 5.11.3，Global 为 5.11.4）。
 	ClientVersion string
 	// CLIVersion 是官方客户端内置 CLI 版本（CN 为 2.179.0，Global 为 2.161.0）。
 	CLIVersion string
@@ -469,7 +469,7 @@ type Endpoints struct {
 
 var (
 	endpointsCN = Endpoints{
-		// ChatBase 与官方 5.8.x 的 product.json endpoint 对齐：模型请求
+		// ChatBase 与官方 5.11.x 的 product.json endpoint 对齐：模型请求
 		// 自 2026-10 起全部走 www.workbuddy.cn（copilot.tencent.com 只是
 		// 桌面网关的兜底常量）。计费/成长域保持不变（两域目前都在线）。
 		ChatBase:       "https://www.workbuddy.cn",
@@ -478,7 +478,7 @@ var (
 		Origin:         "https://www.workbuddy.cn",
 		AcceptLanguage: "zh-CN",
 		PlatformLabel:  "WorkBuddy",
-		ClientVersion:  "5.8.3",
+		ClientVersion:  "5.11.3",
 		CLIVersion:     "2.179.0",
 	}
 	endpointsGlobal = Endpoints{
@@ -488,7 +488,7 @@ var (
 		Origin:         "https://www.workbuddy.ai",
 		AcceptLanguage: "en-US",
 		PlatformLabel:  "workbuddy-ai",
-		ClientVersion:  "5.8.4",
+		ClientVersion:  "5.11.4",
 		CLIVersion:     "2.161.0",
 	}
 )
@@ -563,15 +563,18 @@ const (
 
 // 出站标识内置值。都允许被配置覆盖。
 //
-// 版本号与正版 5.8.3 对齐（UA 三段式取自 daemon.log 头 dump：
-// WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.179.0）。
+// 版本号与正版 5.11.3 对齐（UA 三段式取自 daemon.log 头 dump：
+// WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.179.0）。
+//
+// 版本号来源：workbuddy.cn 更新日志 5.11.3（2026-11-15）、
+// workbuddy.ai 更新日志 5.11.4。CLI 段没有新版抓包，保持 2.179.0。
 const (
-	defaultClientVersion = "5.8.3"
+	defaultClientVersion = "5.11.3"
 	defaultCLIVersion    = "2.179.0"
 	defaultClientName    = "WorkBuddy"
 	// DesktopClientVersion 是桌面指纹族使用的版本（与 CLI 族刻意不同）。
 	// 导出供 tasks 子包构造桌面指纹事件使用。
-	DesktopClientVersion = "5.8.3"
+	DesktopClientVersion = "5.11.3"
 	// codeBuddyIDEUA / codeBuddyCLIUA 是模型目录探测专用 UA。
 	//
 	// /v3/config 对 UA 敏感：过旧会拿到精简目录或 400 code=12403。
@@ -708,8 +711,8 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 
 // applyAttributionHeaders 写入客户端归属头。
 //
-// 官方 5.8.4 对齐：X-Product=SaaS、X-IDE-Type/X-IDE-Name=WorkBuddy、
-// X-IDE-Version=应用版本（CN 5.8.3 / Global 5.8.4）、
+// 官方 5.11.x 对齐：X-Product=SaaS、X-IDE-Type/X-IDE-Name=WorkBuddy、
+// X-IDE-Version=应用版本（CN 5.11.3 / Global 5.11.4）、
 // X-Agent-Intent=craft、X-Agent-Purpose=conversation、X-Agent-Type=main。
 // 国际版实测 X-Private-Data 恒为 true。
 func applyAttributionHeaders(req *http.Request, c *Client, region Region) {
@@ -753,7 +756,7 @@ func endpointHost(base string) string {
 
 // applyConversationHeaders 写入会话头族。
 //
-// 5.8.4 渠道校验（11128）要求必须携带完整的会话头族与链路头族：
+// 5.11.x 渠道校验（11128）要求必须携带完整的会话头族与链路头族：
 //   - X-Conversation-ID：带连字符的标准 UUID（RFC 4122/9562），未指定时现生成；
 //   - X-Conversation-Request-ID / X-Root-Request-ID：每轮生成（UUIDv7-32hex，两者同值）；
 //   - X-Conversation-Message-ID / X-Request-ID：每步新生（UUIDv7-32hex，两者同值）；

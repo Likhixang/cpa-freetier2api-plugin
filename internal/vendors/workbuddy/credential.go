@@ -918,7 +918,7 @@ func newHexID() string {
 
 // NewUUIDv7 生成带连字符的标准 UUIDv7（RFC 9562，36 位）。
 //
-// 官方 5.8.4 客户端的 X-Conversation-ID 要求带连字符的标准 UUID 形态。
+// 官方 5.11.x 客户端的 X-Conversation-ID 要求带连字符的标准 UUID 形态。
 func NewUUIDv7() string {
 	var buf [16]byte
 	if _, errRead := rand.Read(buf[:]); errRead != nil {

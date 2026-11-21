@@ -70,7 +70,7 @@ plugins:
 
 ### Option 3: Build from Source
 
-Requires Go 1.22+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
+Requires Go 1.24+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
 
 ```bash
 git clone https://github.com/Likhixang/cpa-freetier2api-plugin.git

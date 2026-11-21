@@ -420,6 +420,8 @@ func streamErrorDetail(errClose error, message string) *pluginabi.Error {
 		Retryable:         pluginErr.Retryable,
 		HTTPStatus:        pluginErr.HTTPStatus,
 		RetryAfterSeconds: seconds,
+		// 账号级额度耗尽：让宿主把冷却同步到该凭证的全部模型。
+		CredentialScoped: pluginErr.IsCredentialScoped(),
 	}
 }
 
@@ -575,6 +577,14 @@ func (a *App) handleQuotaReset(request []byte) ([]byte, error) {
 	// 而额度并没有因为签到而恢复。
 	if result.NotRecorded {
 		return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: result.Message})
+	}
+	// 签到成功后顺手清掉宿主侧这条凭证的冷却与额度状态：额度已经回补，
+	// 冷却却可能还挂着，宿主会继续跳过它直到自然过期。失败只记日志——
+	// 重置是优化，不能让它把签到结果改写成失败。
+	if resp, errReset := hostbridge.ResetRoutingCooldown(hostbridge.CallbackID(ctx), rpc.AuthIndex); errReset != nil {
+		logger.Debug("reset routing cooldown for %s failed: %v", rpc.AuthIndex, errReset)
+	} else if len(resp.Models) > 0 {
+		logger.Info("reset routing cooldown for %s (%d model(s))", resp.AuthIndex, len(resp.Models))
 	}
 	return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
 }

@@ -408,7 +408,7 @@ func (a *App) handleAuthLoginStart(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	vendor, errVendor := a.vendorForLogin(rpc.Metadata)
+	vendor, errVendor := a.vendorForLogin(rpc.Provider, rpc.Metadata)
 	if errVendor != nil {
 		return nil, errVendor
 	}
@@ -537,7 +537,13 @@ func (a *App) handleAuthLoginPoll(request []byte) ([]byte, error) {
 //
 // 控制台页把用户选的供应商标识放在 Metadata 的 vendor 字段里；
 // 缺失时回落到配置里启用的第一个供应商（兼容旧版页面只传 realm 的情况）。
-func (a *App) vendorForLogin(metadata map[string]any) (core.Vendor, error) {
+func (a *App) vendorForLogin(provider string, metadata map[string]any) (core.Vendor, error) {
+	// 多登录入口：宿主按入口标识发起来登录（schema v10），标识形如
+	// <providerKey>-<vendorID>。基础标识 providerKey 落到下面的通用路径。
+	// 显式 vendor 元数据（控制台老路径）优先级更高。
+	if vendor, okVendor, errVendor := a.vendorFromLoginIdentifier(provider, metadata); okVendor || errVendor != nil {
+		return vendor, errVendor
+	}
 	if metadata != nil {
 		if rawVendor, okVendor := metadata[core.VendorKey].(string); okVendor {
 			vendor, okLookup := a.registry.ByID(rawVendor)
@@ -562,6 +568,39 @@ func (a *App) vendorForLogin(metadata map[string]any) (core.Vendor, error) {
 		return vendor, nil
 	}
 	return nil, core.NewPluginError("vendor_disabled", "no vendor is enabled by plugin configuration", http.StatusBadRequest)
+}
+
+// vendorFromLoginIdentifier 按多入口标识定位供应商。
+//
+// 返回 okVendor=false 且 err=nil 表示「这个标识不该由本函数决定」，调用方继续
+// 走元数据/默认供应商路径：基础标识 providerKey、空标识、以及调用方显式带了
+// vendor 元数据（控制台老路径）都属于这种情况。
+func (a *App) vendorFromLoginIdentifier(provider string, metadata map[string]any) (core.Vendor, bool, error) {
+	trimmed := strings.TrimSpace(provider)
+	if trimmed == "" || strings.EqualFold(trimmed, providerKey) {
+		return nil, false, nil
+	}
+	if metadata != nil {
+		if rawVendor, okVendor := metadata[core.VendorKey].(string); okVendor && strings.TrimSpace(rawVendor) != "" {
+			// 显式指定了供应商：入口标识不覆盖它。
+			return nil, false, nil
+		}
+	}
+	prefix := providerKey + "-"
+	if !strings.HasPrefix(trimmed, prefix) {
+		return nil, false, nil
+	}
+	vendorID := strings.TrimPrefix(trimmed, prefix)
+	vendor, okLookup := a.registry.ByID(vendorID)
+	if !okLookup {
+		return nil, true, core.NewPluginError("invalid_request",
+			fmt.Sprintf("unknown login entry %q", trimmed), http.StatusBadRequest)
+	}
+	if !a.vendorEnabled(vendor) {
+		return nil, true, core.NewPluginError("vendor_disabled",
+			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+	}
+	return vendor, true, nil
 }
 
 // vendorForLoginSession 按登录会话找供应商。

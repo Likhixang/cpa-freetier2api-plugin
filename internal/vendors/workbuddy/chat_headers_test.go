@@ -42,7 +42,7 @@ func TestNewUUIDV7Format(t *testing.T) {
 }
 
 // TestChatHeadersMatchGenuineClientCN 验证国内版对话请求头与正版 CLI 直发形态一致：
-// 版本三段 UA (5.8.3)、归属头（X-Product=SaaS 等）、UUIDv7 会话头族、W3C trace 族、Origin/Referer/语言。
+// 版本三段 UA (5.11.3)、归属头（X-Product=SaaS 等）、UUIDv7 会话头族、W3C trace 族、Origin/Referer/语言。
 func TestChatHeadersMatchGenuineClientCN(t *testing.T) {
 	rt := newRuntime(core.Env{})
 	rt.configure(core.Settings{MachineSalt: "salt-1"}, map[string]string{})
@@ -58,14 +58,14 @@ func TestChatHeadersMatchGenuineClientCN(t *testing.T) {
 
 	// 归属与版本。
 	ua := req.Header.Get("User-Agent")
-	if ua != "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.179.0" {
+	if ua != "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.179.0" {
 		t.Fatalf("User-Agent = %q", ua)
 	}
 	for key, want := range map[string]string{
 		"X-Product":           "SaaS",
 		"X-IDE-Type":          "WorkBuddy",
 		"X-IDE-Name":          "WorkBuddy",
-		"X-IDE-Version":       "5.8.3",
+		"X-IDE-Version":       "5.11.3",
 		"X-Agent-Intent":      "craft",
 		"X-Agent-Purpose":     "conversation",
 		"X-Agent-Type":        "main",
@@ -147,7 +147,7 @@ func TestChatHeadersMatchGenuineClientCN(t *testing.T) {
 }
 
 // TestChatHeadersMatchGenuineClientGlobal 验证国际版对话请求头：
-// UA (5.8.4 workbuddy-ai CLI/2.161.0)、X-Private-Data=true、X-Domain=www.workbuddy.ai、完整会话头族。
+// UA (5.11.4 workbuddy-ai CLI/2.161.0)、X-Private-Data=true、X-Domain=www.workbuddy.ai、完整会话头族。
 func TestChatHeadersMatchGenuineClientGlobal(t *testing.T) {
 	rt := newRuntime(core.Env{})
 	rt.configure(core.Settings{MachineSalt: "salt-1"}, map[string]string{})
@@ -161,16 +161,16 @@ func TestChatHeadersMatchGenuineClientGlobal(t *testing.T) {
 	meta := ChatMetaFromBody([]byte(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}`))
 	c.applyChatHeaders(req, cred, meta, "")
 
-	// 国际版 5.8.4 身份核对。
+	// 国际版 5.11.4 身份核对。
 	ua := req.Header.Get("User-Agent")
-	if ua != "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0" {
-		t.Fatalf("Global User-Agent = %q, want WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0", ua)
+	if ua != "WorkBuddy/5.11.4 workbuddy-ai/5.11.4 CLI/2.161.0" {
+		t.Fatalf("Global User-Agent = %q, want WorkBuddy/5.11.4 workbuddy-ai/5.11.4 CLI/2.161.0", ua)
 	}
 	for key, want := range map[string]string{
 		"X-Product":           "SaaS",
 		"X-IDE-Type":          "WorkBuddy",
 		"X-IDE-Name":          "WorkBuddy",
-		"X-IDE-Version":       "5.8.4",
+		"X-IDE-Version":       "5.11.4",
 		"X-Agent-Intent":      "craft",
 		"X-Agent-Purpose":     "conversation",
 		"X-Agent-Type":        "main",

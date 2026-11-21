@@ -32,6 +32,9 @@ const (
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
+	// MultiAuthProviders 是宿主声明的能力（schema v10 起）：为 true 时插件可以
+	// 在 auth.identifier 里回多个 OAuth 登录入口。
+	MultiAuthProviders bool `json:"multi_auth_providers,omitempty"`
 }
 
 type registration struct {
@@ -51,6 +54,44 @@ type registrationCapabilities struct {
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
+}
+
+// authLoginIdentifier 是某个供应商在登录页上的入口标识。
+//
+// 前缀固定为基础 providerKey，保证「登录入口」与「凭证归属」是两件事：
+// 入口只决定走哪家的登录协议，凭证仍然写 providerKey。
+func authLoginIdentifier(vendorID string) string {
+	return providerKey + "-" + vendorID
+}
+
+// authIdentifierResponse 构造 auth.identifier 的响应。
+//
+// 基础标识恒为 providerKey：所有凭证文件、模型注册、executor 与 quota 都挂在
+// 它上面，加登录入口不改变凭证归属。
+//
+// 宿主 schema v10 起支持多入口（register 里的 multi_auth_providers）：每个启用
+// 的供应商再暴露一个 <providerKey>-<vendorID> 标识，登录页就能直接列出
+// 「WorkBuddy 国内版」这类具体入口。旧宿主只看 identifier 字段，行为不变。
+func (a *App) authIdentifierResponse() identifierResponse {
+	resp := identifierResponse{Identifier: providerKey}
+	if !a.multiAuth {
+		return resp
+	}
+	resp.Identifiers = []string{providerKey}
+	resp.CredentialProviders = []string{providerKey}
+	resp.Entries = []pluginapi.AuthProviderEntry{{Identifier: providerKey, Name: pluginDisplayName}}
+	for _, vendor := range a.registry.Vendors() {
+		if !a.vendorEnabled(vendor) {
+			continue
+		}
+		identifier := authLoginIdentifier(vendor.ID())
+		resp.Identifiers = append(resp.Identifiers, identifier)
+		resp.Entries = append(resp.Entries, pluginapi.AuthProviderEntry{
+			Identifier: identifier,
+			Name:       vendor.Name(),
+		})
+	}
+	return resp
 }
 
 // HandleMethod 是插件 ABI 的总入口。
@@ -75,7 +116,7 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return a.handleModelForAuth(request)
 
 	case pluginabi.MethodAuthIdentifier:
-		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
+		return core.OKEnvelope(a.authIdentifierResponse())
 	case pluginabi.MethodAuthParse:
 		return a.handleAuthParse(request)
 	case pluginabi.MethodAuthLoginStart:
@@ -119,6 +160,13 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 
 type identifierResponse struct {
 	Identifier string `json:"identifier"`
+	// Identifiers 是全部登录入口标识（第一个必须是基础标识，保持旧宿主语义）。
+	Identifiers []string `json:"identifiers,omitempty"`
+	// CredentialProviders 声明哪几个标识会持有已保存的凭证。本插件只写
+	// 基础标识，所以恒为 [identifier]：换登录入入口不会换凭证归属。
+	CredentialProviders []string `json:"credential_providers,omitempty"`
+	// Entries 给登录页提供每个入口的显示名。
+	Entries []pluginapi.AuthProviderEntry `json:"entries,omitempty"`
 }
 
 func (a *App) handlePluginRegister(request []byte) ([]byte, error) {
@@ -129,6 +177,8 @@ func (a *App) handlePluginRegister(request []byte) ([]byte, error) {
 	if errConfig != nil {
 		return nil, fmt.Errorf("plugin.register: %w", errConfig)
 	}
+	// 宿主在 register 里声明能力：schema v10 起才有多 OAuth 登录入口。
+	a.multiAuth = lifecycleMultiAuthFrom(request)
 	if errApply := a.ApplyConfig(cfg); errApply != nil {
 		return nil, fmt.Errorf("plugin.register: %w", errApply)
 	}
@@ -152,6 +202,7 @@ func (a *App) handlePluginReconfigure(request []byte) ([]byte, error) {
 	if errConfig != nil {
 		return nil, fmt.Errorf("plugin.reconfigure: %w", errConfig)
 	}
+	a.multiAuth = lifecycleMultiAuthFrom(request)
 	previous := a.Config()
 	if errApply := a.ApplyConfig(cfg); errApply != nil {
 		return nil, fmt.Errorf("plugin.reconfigure: %w", errApply)
@@ -164,6 +215,18 @@ func (a *App) handlePluginReconfigure(request []byte) ([]byte, error) {
 	a.applyModelCatalog(cfg)
 	logger.Info("reconfigured: realms=%v state_dir=%s", cfg.EnabledRealms, cfg.StateDir)
 	return core.OKEnvelope(a.Registration())
+}
+
+// lifecycleMultiAuthFrom 读取宿主在 register/reconfigure 里声明的多入口能力。
+func lifecycleMultiAuthFrom(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var req lifecycleRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return false
+	}
+	return req.MultiAuthProviders
 }
 
 func configYAMLFrom(raw []byte) []byte {

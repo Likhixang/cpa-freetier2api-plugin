@@ -19,7 +19,7 @@ import (
 )
 
 // DefaultVersion 是未注入发行版号时的版本。
-const DefaultVersion = "0.1.49"
+const DefaultVersion = "0.1.50"
 
 // Options 是 App 的构造参数。
 type Options struct {
@@ -48,6 +48,10 @@ type App struct {
 
 	lifecycleMu sync.Mutex
 	registered  bool
+	// multiAuth 记录宿主是否声明支持多 OAuth 登录入口（schema v10 的
+	// multi_auth_providers）。为 false 时 auth.identifier 只回单个标识，
+	// 保持旧宿主行为不变。
+	multiAuth bool
 
 	credentialMu    sync.Mutex
 	credentialCache map[string]credentialCacheEntry

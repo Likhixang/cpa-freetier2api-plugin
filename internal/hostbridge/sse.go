@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"io"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // SSEScannerBuffer 是单帧的上限（默认 64KB 会截断工具参数这类长帧）。
@@ -37,11 +39,17 @@ func NewSSEScanner(r io.Reader) *bufio.Scanner {
 //
 // 全程零有效帧不算错误：上游有时返回一条没有任何 delta 的流，
 // 把它当错误会让客户端收到无意义的错误帧。
+//
+// 出过有效帧却没有结束帧就 EOF，按 core.ErrStreamTruncated 返回：宿主会把
+// 这类失败当成 stream_truncated（不冷却凭证、不重放请求），而不是当成上游
+// 挂了去冷却一个其实好用的账号。
 func ForwardRawSSE(body io.Reader, emit func([]byte) error) error {
 	if body == nil {
 		return nil
 	}
 	scanner := NewSSEScanner(body)
+	emitted := 0
+	sawTerminal := false
 
 	for scanner.Scan() {
 		line := strings.TrimRight(scanner.Text(), "\r")
@@ -63,9 +71,33 @@ func ForwardRawSSE(body io.Reader, emit func([]byte) error) error {
 		if payload == "" {
 			continue
 		}
+		if isTerminalSSEPayload(payload) {
+			sawTerminal = true
+		}
 		if errEmit := emit([]byte(payload)); errEmit != nil {
 			return errEmit
 		}
+		emitted++
 	}
-	return scanner.Err()
+	if errScan := scanner.Err(); errScan != nil {
+		return errScan
+	}
+	if emitted > 0 && !sawTerminal {
+		return core.ErrStreamTruncated
+	}
+	return nil
+}
+
+// isTerminalSSEPayload 判断这一帧是否携带了「本轮生成已结束」的信号。
+//
+// 判据刻意宽松：finish_reason / finishReason / stop_reason / event: message_stop
+// 任一出现都算结束。误判的代价只是不冷却凭证（比冷却一个好账号轻），
+// 漏判的代价是把正常收尾的流当成截断 —— 所以宁可放宽。
+func isTerminalSSEPayload(payload string) bool {
+	for _, marker := range []string{`"finish_reason"`, `"finishReason"`, `"stop_reason"`, `message_stop`} {
+		if strings.Contains(payload, marker) {
+			return true
+		}
+	}
+	return false
 }

@@ -77,14 +77,24 @@ func ToPluginError(err error) error {
 	if err == nil {
 		return nil
 	}
+	// 上游流在没有任何结束帧的情况下断了：凭证没问题，重放也没意义。
+	// 用宿主的 stream_truncated 语义，避免把好凭证打进冷却。
+	if errors.Is(err, ErrStreamTruncated) {
+		return &PluginError{
+			Code:       codeStreamTruncated,
+			Message:    err.Error(),
+			HTTPStatus: http.StatusBadGateway,
+		}
+	}
 	var upstreamErr UpstreamError
 	if errors.As(err, &upstreamErr) {
 		status := upstreamErr.HTTPStatus()
 		if status <= 0 {
 			status = http.StatusBadGateway
 		}
-		code := upstreamCode(upstreamErr.UpstreamKind())
+		code, credentialScoped := hostCodeFor(upstreamErr.UpstreamKind())
 		pluginErr := NewPluginError(code, err.Error(), status)
+		pluginErr.CredentialScoped = credentialScoped
 		if upstreamErr.Retryable() {
 			pluginErr.Retryable = true
 		}
@@ -96,8 +106,9 @@ func ToPluginError(err error) error {
 	// 故障报 502，宿主不做限流冷却，客户端拿到的是 500。
 	if failure := reconstructBridgeFailure(err); failure != nil {
 		status := failure.HTTPStatus()
-		code := upstreamCode(failure.Kind.String())
+		code, credentialScoped := hostCodeFor(failure.Kind.String())
 		pluginErr := NewPluginError(code, failure.Msg, status)
+		pluginErr.CredentialScoped = credentialScoped
 		if failure.Retryable() {
 			pluginErr.Retryable = true
 		}
@@ -218,12 +229,57 @@ func retryAfterSeconds(err error) int {
 }
 
 // upstreamCode 生成错误码：upstream_<kind>。
-func upstreamCode(kind string) string {
-	kind = strings.TrimSpace(kind)
-	if kind == "" {
-		return "upstream_error"
+// 宿主可识别的错误码（对齐 pluginabi.ErrorCode*）。
+//
+// 宿主的冷却/路由管线只认这几个值：它们决定这次失败冷却整个凭证、只冷却当前
+// 模型、还是完全不冷却。其余情况继续用 upstream_<kind> 作为排障用标识。
+const (
+	codeCredentialQuota     = "credential_quota"
+	codeTransientRateLimit  = "transient_rate_limit"
+	codeRequestScoped       = "request_scoped"
+	codeStreamTruncated     = "stream_truncated"
+	codeModelNotFound       = "model_not_found"
+	codeConnectionLifecycle = "connection_lifecycle"
+	codeTransientTransport  = "transient_transport"
+)
+
+// ErrStreamTruncated 表示上游流式响应在没有任何结束帧的情况下断了。
+//
+// 这类失败是「上游已经接了这次请求，但没写完」——重放请求没有意义，冷却凭证
+// 也没有意义（凭证本身是好的）。宿主为此提供了 stream_truncated 语义。
+var ErrStreamTruncated = errors.New("upstream stream ended without a completion frame")
+
+// hostCodeFor 把供应商分类翻成宿主认识的处理语义。
+//
+// 返回的 credentialScoped 为 true 时，宿主会把冷却同步到该凭证的全部模型：
+// 只对「账号级额度耗尽」成立（免费额度的日配额），不能因为一次模型级 429 就
+// 把整个账号按住。
+func hostCodeFor(kind string) (code string, credentialScoped bool) {
+	switch FailureKind(strings.TrimSpace(kind)) {
+	case FailureKindHardCredit, FailureKindQuota:
+		// 账号余额/额度耗尽：整条凭证都不可用。
+		return codeCredentialQuota, true
+	case FailureKindSoftRate, FailureKindRateLimit:
+		// 模型级容量/准入限流：只冷却当前模型。
+		return codeTransientRateLimit, false
+	case FailureKindModelBlocked:
+		// 上游明确说该模型不可用：只冷却这个模型。
+		return codeModelNotFound, false
+	case FailureKindContentBlocked, FailureKindPromptTooLong,
+		FailureKindBadParams, FailureKindImageInvalid, FailureKindClient:
+		// 请求自身的问题：不冷却凭证，也不轮换重试。
+		return codeRequestScoped, false
 	}
-	return "upstream_" + kind
+	if trimmed := strings.TrimSpace(kind); trimmed != "" {
+		return "upstream_" + trimmed, false
+	}
+	return "upstream_error", false
+}
+
+// upstreamCode 保留旧签名，供只关心错误码文本的调用方使用。
+func upstreamCode(kind string) string {
+	code, _ := hostCodeFor(kind)
+	return code
 }
 
 // envelope 是 CPA 插件 ABI 的 JSON 信封，与宿主 cpasdk/pluginabi.Envelope 对齐。
@@ -242,6 +298,10 @@ type envelopeError struct {
 	// RetryAfterSeconds 是上游明示的等待秒数。新宿主会把它翻成 Retry-After
 	// 响应头交给客户端；旧宿主忽略该字段，不影响兼容。
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	// CredentialScoped 声明这次失败作用于整个凭证（账号级额度耗尽），
+	// 而不是只有当前模型。宿主（schema v8.0.x+）据此把冷却同步到该凭证的
+	// 全部模型；旧宿主忽略该字段。
+	CredentialScoped bool `json:"credential_scoped,omitempty"`
 }
 
 // PluginError 是插件内部的结构化错误：可携带 HTTP 状态码与可重试标记。
@@ -255,6 +315,8 @@ type PluginError struct {
 	HTTPStatus int
 	// RetryAfterSeconds 来自上游明示的等待信息（0 表示未给出）。
 	RetryAfterSeconds int
+	// CredentialScoped 报告失败是否作用于整个凭证（账号级额度耗尽）。
+	CredentialScoped bool
 }
 
 // Error 实现 error 接口。
@@ -263,6 +325,17 @@ func (e *PluginError) Error() string {
 		return ""
 	}
 	return e.Message
+}
+
+// IsCredentialScoped 报告这次失败是否作用于整个凭证。
+//
+// 显式标记与 credential_quota 错误码等价：宿主侧也是这么判定的
+// （pluginabi.Error.IsCredentialScoped）。
+func (e *PluginError) IsCredentialScoped() bool {
+	if e == nil {
+		return false
+	}
+	return e.CredentialScoped || e.Code == codeCredentialQuota
 }
 
 // NewPluginError 构造一个带 HTTP 状态码的插件错误。
@@ -305,6 +378,9 @@ func ErrorEnvelopeFromError(err error) []byte {
 			Retryable:         pluginErr.Retryable,
 			HTTPStatus:        pluginErr.HTTPStatus,
 			RetryAfterSeconds: pluginErr.RetryAfterSeconds,
+			// 账号级额度耗尽时告诉宿主「这条凭证整体不可用」，否则宿主只冷却
+			// 当前模型，同一账号的其他模型还会被继续调度上去。
+			CredentialScoped: pluginErr.IsCredentialScoped(),
 		}})
 		return raw
 	}

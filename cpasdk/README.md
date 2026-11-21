@@ -5,8 +5,18 @@
 - `pluginabi/types.go` 对齐宿主 `sdk/pluginabi/types.go`；
 - `pluginapi/types.go` 对齐宿主 `sdk/pluginapi/types.go`。
 
+**当前对齐版本：CLIProxyAPI v8.0.80（ABIVersion 1 / SchemaVersion 10）。**
+
 同步方式：从宿主对应版本复制这两个文件，保持排版一致；`gofmt` 检查刻意排除本目录。
 宿主升级 ABI 时先更新这里，再调整 `internal/app` 的 RPC 适配层。
+
+## 与上游的两处刻意偏离
+
+1. **导入用标准库 `encoding/json`**：宿主从 v8.0.7x 起改用 `github.com/MoeForge/moego/json`，
+   本插件保持零第三方依赖，只改导入行，类型定义与上游逐字一致。
+2. **本地扩展字段**（宿主解码时忽略，只有本插件自己消费，同步上游时不要删）：
+   - `pluginapi.QuotaFetchResponse.Claim` / `pluginapi.ClaimStatus`：活动套餐领取状态；
+   - `pluginapi.ManagementRequest.Context` / `RequestContext()`：管理请求生命周期。
 
 ## 宿主请求缓冲区契约（`cliproxy_plugin_api.call` 的 `request`）
 
